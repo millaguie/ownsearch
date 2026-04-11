@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ownsearch"
+version = "0.1.0"
+description = "Smart full-text and semantic search for your local documents"
+requires-python = ">=3.10"
+license = "GPL-3.0-only"
+
+[project.scripts]
+ownsearch = "ownsearch:main"
+
+[tool.setuptools]
+py-modules = ["ownsearch"]
