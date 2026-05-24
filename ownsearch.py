@@ -146,21 +146,41 @@ def ensure_embeddings_ready(config):
     return ollama_pull_model(config)
 
 
+# Sentinel: the server rejected this specific input deterministically (e.g.
+# bge-m3 emits NaN for certain token sequences and ollama can't serialize it).
+# Retrying never helps, so we fail fast and leave the chunk FTS-only. It is an
+# (empty) list subclass so it stays falsy and type-compatible with real results;
+# callers tell it apart from a normal empty/None result via `is PERMANENT_FAIL`.
+class _PermanentFail(list):
+    pass
+
+
+PERMANENT_FAIL = _PermanentFail()
+
+
 def get_embeddings_batch(config, texts):
-    """Get embeddings for a batch of texts from ollama. Truncates and retries on failure."""
+    """Get embeddings for a batch of texts from ollama. Truncates and retries on failure.
+
+    Returns a list aligned with ``texts``; each item is the embedding vector, or
+    ``None`` for a transient failure (worth retrying later), or ``PERMANENT_FAIL``
+    when the model can't embed that specific text.
+    """
     # Truncate texts to avoid OOM on the server
     truncated = [t[:2000] for t in texts]
 
     # Try batch first
     embeddings = _embed_request(config, truncated)
-    if embeddings and len(embeddings) == len(texts):
+    if embeddings is not PERMANENT_FAIL and embeddings and len(embeddings) == len(texts):
         return embeddings
 
-    # Batch failed — fall back to one-by-one with backoff
+    # Batch failed — fall back to one-by-one. A single poisoned text (NaN) makes
+    # ollama 500 the whole batch, so isolating per-text salvages the rest.
     results = []
     for text in truncated:
         vec = _embed_request(config, text)
-        if vec:
+        if vec is PERMANENT_FAIL:
+            results.append(PERMANENT_FAIL)
+        elif vec:
             results.append(vec[0] if isinstance(vec[0], list) else vec)
         else:
             results.append(None)
@@ -169,7 +189,13 @@ def get_embeddings_batch(config, texts):
 
 
 def _embed_request(config, input_data, retries=5):
-    """Raw embed request with exponential backoff retry."""
+    """Raw embed request with exponential backoff retry.
+
+    Returns the embeddings list on success, ``[]`` on transient failure (after
+    exhausting retries), or ``PERMANENT_FAIL`` when the server reports a
+    deterministic, content-specific error (NaN serialization) — retrying those
+    only wastes the backoff budget, so we bail immediately.
+    """
     data = json.dumps({"model": config.embed_model, "input": input_data}).encode()
 
     for attempt in range(retries + 1):
@@ -182,14 +208,29 @@ def _embed_request(config, input_data, retries=5):
             with urllib.request.urlopen(req, timeout=120) as resp:
                 result = json.loads(resp.read())
             return result.get("embeddings", [])
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", "replace")
+            except Exception:
+                pass
+            if "NaN" in body or "unsupported value" in body:
+                print(
+                    f"  Skipping unembeddable chunk (model returned NaN): {body.strip()[:120]}",
+                    file=sys.stderr,
+                )
+                return PERMANENT_FAIL
+            err = e
         except Exception as e:
-            if attempt < retries:
-                wait = min(2 ** (attempt + 1), 60)  # 2s, 4s, 8s, 16s, 32s
-                print(f"  Retry {attempt + 1}/{retries} in {wait}s: {e}", file=sys.stderr)
-                time.sleep(wait)
-                continue
-            print(f"  Warning: embedding failed after {retries + 1} attempts: {e}", file=sys.stderr)
-            return []
+            err = e
+
+        if attempt < retries:
+            wait = min(2 ** (attempt + 1), 60)  # 2s, 4s, 8s, 16s, 32s
+            print(f"  Retry {attempt + 1}/{retries} in {wait}s: {err}", file=sys.stderr)
+            time.sleep(wait)
+            continue
+        print(f"  Warning: embedding failed after {retries + 1} attempts: {err}", file=sys.stderr)
+        return []
 
 
 # --- Database ---
@@ -528,6 +569,7 @@ def cmd_index(args, config):
     # Index new/changed files
     total_chunks = 0
     embed_queue = []
+    failed_ids = []  # chunk_ids whose embedding failed during this run
 
     for i, path in enumerate(to_index, 1):
         full_path = Path(path)
@@ -561,7 +603,7 @@ def cmd_index(args, config):
                 embed_queue.append((cur.lastrowid, embed_text[:8000]))
 
             if has_embeddings and len(embed_queue) >= BATCH_SIZE:
-                _process_embed_batch(config, conn, embed_queue)
+                failed_ids += _process_embed_batch(config, conn, embed_queue)
                 embed_queue = []
 
         if i % 20 == 0:
@@ -569,7 +611,27 @@ def cmd_index(args, config):
             conn.commit()
 
     if has_embeddings and embed_queue:
-        _process_embed_batch(config, conn, embed_queue)
+        failed_ids += _process_embed_batch(config, conn, embed_queue)
+
+    # Any file with a failed embedding is unmarked (mtime_ns = -1) so the next
+    # incremental run re-indexes it. We keep its chunks for now, so the file
+    # stays searchable (FTS + whatever embeddings did succeed) in the meantime.
+    if failed_ids:
+        placeholders = ",".join("?" * len(failed_ids))
+        failed_files = {
+            row[0]
+            for row in conn.execute(
+                f"SELECT DISTINCT file_path FROM chunks WHERE id IN ({placeholders})",
+                failed_ids,
+            )
+        }
+        for fp in failed_files:
+            conn.execute("UPDATE files SET mtime_ns = -1 WHERE path = ?", (fp,))
+        print(
+            f"  Warning: {len(failed_ids)} chunk(s) across {len(failed_files)} file(s) "
+            f"failed to embed; those files will be re-indexed on the next run.",
+            file=sys.stderr,
+        )
 
     # Store the model used for these embeddings
     if has_embeddings:
@@ -583,17 +645,33 @@ def cmd_index(args, config):
 
 
 def _process_embed_batch(config, conn, queue):
+    """Embed a batch of (chunk_id, text) and store the vectors.
+
+    Returns the list of chunk_ids that failed *transiently* (worth retrying),
+    so the caller can avoid marking their source file as fully indexed —
+    otherwise an incremental re-index would never retry them (the file's
+    mtime/size already match). Permanent failures (the model can't embed that
+    specific text) are skipped silently: their chunks stay FTS-only and the
+    file is left marked as indexed, so we don't loop on them every run.
+    """
     ids = [q[0] for q in queue]
     texts = [q[1] for q in queue]
     vectors = get_embeddings_batch(config, texts)
     if vectors and len(vectors) == len(ids):
+        failed = []
         for chunk_id, vec in zip(ids, vectors):
+            if vec is PERMANENT_FAIL:
+                continue  # already logged; leave FTS-only, do not retry
             if vec is None:
+                failed.append(chunk_id)
                 continue
             conn.execute(
                 "INSERT OR REPLACE INTO embeddings (chunk_id, vector) VALUES (?, ?)",
                 (chunk_id, pack_vector(vec)),
             )
+        return failed
+    # Whole batch failed transiently (server unreachable / length mismatch).
+    return list(ids)
 
 
 def cmd_search(args, config):
@@ -681,8 +759,8 @@ def search_fts(conn, query, limit=10):
 def search_semantic(config, conn, query, limit=10):
     """Semantic search using embeddings."""
     vectors = get_embeddings_batch(config, [query])
-    if not vectors:
-        print("Semantic search unavailable (ollama not reachable or model missing).", file=sys.stderr)
+    if not vectors or vectors[0] is PERMANENT_FAIL or not vectors[0]:
+        print("Semantic search unavailable (ollama not reachable, model missing, or query not embeddable).", file=sys.stderr)
         return []
 
     query_vec = vectors[0]
