@@ -26,7 +26,15 @@ MAX_CHUNK_CHARS = 4000
 BATCH_SIZE = 5
 
 INDEXABLE_EXTS = {".md", ".txt", ".org", ".rst"}
-SKIP_DIRS = {".git", ".obsidian", ".claude", "node_modules", "__pycache__", ".venv", "venv"}
+SKIP_DIRS = {
+    ".git",
+    ".obsidian",
+    ".claude",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+}
 
 
 class Config:
@@ -135,14 +143,17 @@ def ollama_pull_model(config):
 def ensure_embeddings_ready(config):
     """Ensure ollama is available and has the embedding model. Auto-pulls if needed."""
     if not ollama_available(config):
-        print(f"  Ollama not reachable at {config.ollama_url}. Semantic search disabled.", file=sys.stderr)
+        print(
+            f"  Ollama not reachable at {config.ollama_url}. Semantic search disabled.",
+            file=sys.stderr,
+        )
         return False
 
     if ollama_has_model(config):
         return True
 
     print(f"  Model '{config.embed_model}' not found in ollama.", file=sys.stderr)
-    print(f"  Attempting to pull it automatically...", file=sys.stderr)
+    print("  Attempting to pull it automatically...", file=sys.stderr)
     return ollama_pull_model(config)
 
 
@@ -170,7 +181,11 @@ def get_embeddings_batch(config, texts):
 
     # Try batch first
     embeddings = _embed_request(config, truncated)
-    if embeddings is not PERMANENT_FAIL and embeddings and len(embeddings) == len(texts):
+    if (
+        embeddings is not PERMANENT_FAIL
+        and embeddings
+        and len(embeddings) == len(texts)
+    ):
         return embeddings
 
     # Batch failed — fall back to one-by-one. A single poisoned text (NaN) makes
@@ -229,7 +244,10 @@ def _embed_request(config, input_data, retries=5):
             print(f"  Retry {attempt + 1}/{retries} in {wait}s: {err}", file=sys.stderr)
             time.sleep(wait)
             continue
-        print(f"  Warning: embedding failed after {retries + 1} attempts: {err}", file=sys.stderr)
+        print(
+            f"  Warning: embedding failed after {retries + 1} attempts: {err}",
+            file=sys.stderr,
+        )
         return []
 
 
@@ -308,14 +326,14 @@ def init_db(conn):
 def chunk_markdown(text):
     """Split markdown into chunks by headings, with breadcrumb context."""
     chunks = []
-    parts = re.split(r'(^#{1,3}\s+.+$)', text, flags=re.MULTILINE)
+    parts = re.split(r"(^#{1,3}\s+.+$)", text, flags=re.MULTILINE)
 
     current_heading = ""
     current_text = ""
     heading_stack = []
 
     for part in parts:
-        heading_match = re.match(r'^(#{1,3})\s+(.+)$', part)
+        heading_match = re.match(r"^(#{1,3})\s+(.+)$", part)
         if heading_match:
             if current_text.strip():
                 for sub in _split_large(current_text.strip(), current_heading):
@@ -355,7 +373,7 @@ def _split_large(text, heading):
         return [(heading, text)]
 
     result = []
-    paragraphs = re.split(r'\n\n+', text)
+    paragraphs = re.split(r"\n\n+", text)
     current = ""
     for para in paragraphs:
         if len(current) + len(para) + 2 > MAX_CHUNK_CHARS and current:
@@ -426,7 +444,7 @@ def cmd_add_dir(args, config):
     dirs.append(path_str)
     config.save()
     print(f"Added: {path}")
-    print(f"Run 'ownsearch index' to index it.")
+    print("Run 'ownsearch index' to index it.")
 
 
 def cmd_remove_dir(args, config):
@@ -437,7 +455,11 @@ def cmd_remove_dir(args, config):
     dirs = config.data["directories"]
     if path_str not in dirs:
         # Try matching by suffix
-        matches = [d for d in dirs if d.endswith(args.path) or d.endswith(args.path.rstrip("/"))]
+        matches = [
+            d
+            for d in dirs
+            if d.endswith(args.path) or d.endswith(args.path.rstrip("/"))
+        ]
         if matches:
             path_str = matches[0]
         else:
@@ -450,7 +472,10 @@ def cmd_remove_dir(args, config):
     # Remove from DB
     conn = sqlite3.connect(str(config.db_path))
     init_db(conn)
-    conn.execute("DELETE FROM chunks WHERE file_path IN (SELECT path FROM files WHERE directory = ?)", (path_str,))
+    conn.execute(
+        "DELETE FROM chunks WHERE file_path IN (SELECT path FROM files WHERE directory = ?)",
+        (path_str,),
+    )
     conn.execute("DELETE FROM files WHERE directory = ?", (path_str,))
     conn.commit()
     conn.close()
@@ -479,7 +504,9 @@ def cmd_config_set(args, config):
 
     valid_keys = {"db_path", "ollama_url", "embed_model"}
     if key not in valid_keys:
-        print(f"Invalid key. Valid keys: {', '.join(sorted(valid_keys))}", file=sys.stderr)
+        print(
+            f"Invalid key. Valid keys: {', '.join(sorted(valid_keys))}", file=sys.stderr
+        )
         sys.exit(1)
 
     old_value = config.data.get(key)
@@ -492,10 +519,15 @@ def cmd_config_set(args, config):
         if config.db_path.exists():
             conn = sqlite3.connect(str(config.db_path))
             conn.execute("DELETE FROM embeddings")
-            conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_model', ?)", (value,))
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_model', ?)",
+                (value,),
+            )
             conn.commit()
             conn.close()
-            print(f"Embedding model changed ({old_value} -> {value}). All embeddings cleared.")
+            print(
+                f"Embedding model changed ({old_value} -> {value}). All embeddings cleared."
+            )
             print("Run 'ownsearch index --full' to re-generate embeddings.")
 
 
@@ -512,11 +544,18 @@ def cmd_index(args, config):
     init_db(conn)
 
     # Check if embed model changed since last index
-    stored_model = conn.execute("SELECT value FROM meta WHERE key = 'embed_model'").fetchone()
+    stored_model = conn.execute(
+        "SELECT value FROM meta WHERE key = 'embed_model'"
+    ).fetchone()
     if stored_model and stored_model[0] != config.embed_model:
-        print(f"Embedding model changed ({stored_model[0]} -> {config.embed_model}). Clearing old embeddings.")
+        print(
+            f"Embedding model changed ({stored_model[0]} -> {config.embed_model}). Clearing old embeddings."
+        )
         conn.execute("DELETE FROM embeddings")
-        conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_model', ?)", (config.embed_model,))
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_model', ?)",
+            (config.embed_model,),
+        )
         conn.commit()
 
     # Check embeddings availability (auto-pull if needed)
@@ -527,10 +566,14 @@ def cmd_index(args, config):
     for dir_path in config.directories:
         dp = Path(dir_path)
         if not dp.exists():
-            print(f"  Warning: directory not found, skipping: {dir_path}", file=sys.stderr)
+            print(
+                f"  Warning: directory not found, skipping: {dir_path}", file=sys.stderr
+            )
             continue
         dir_str = str(dp)
-        for abs_path, _, mtime_ns, size in walk_directory(dp, config.extensions, config.skip_dirs):
+        for abs_path, _, mtime_ns, size in walk_directory(
+            dp, config.extensions, config.skip_dirs
+        ):
             current_files[abs_path] = (dir_str, mtime_ns, size)
 
     # Get stored file states
@@ -635,7 +678,10 @@ def cmd_index(args, config):
 
     # Store the model used for these embeddings
     if has_embeddings:
-        conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_model', ?)", (config.embed_model,))
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_model', ?)",
+            (config.embed_model,),
+        )
     conn.commit()
     print(f"Done. {len(to_index)} files, {total_chunks} chunks indexed.")
     if has_embeddings:
@@ -746,13 +792,15 @@ def search_fts(conn, query, limit=10):
     results = []
     for path, heading, snippet_text, score in rows:
         clean_snippet = snippet_text.replace(">>>", "").replace("<<<", "")
-        results.append({
-            "path": path,
-            "heading": heading or "",
-            "snippet": clean_snippet,
-            "score": round(-score, 4),
-            "method": "fts",
-        })
+        results.append(
+            {
+                "path": path,
+                "heading": heading or "",
+                "snippet": clean_snippet,
+                "score": round(-score, 4),
+                "method": "fts",
+            }
+        )
     return results
 
 
@@ -760,7 +808,10 @@ def search_semantic(config, conn, query, limit=10):
     """Semantic search using embeddings."""
     vectors = get_embeddings_batch(config, [query])
     if not vectors or vectors[0] is PERMANENT_FAIL or not vectors[0]:
-        print("Semantic search unavailable (ollama not reachable, model missing, or query not embeddable).", file=sys.stderr)
+        print(
+            "Semantic search unavailable (ollama not reachable, model missing, or query not embeddable).",
+            file=sys.stderr,
+        )
         return []
 
     query_vec = vectors[0]
@@ -788,13 +839,15 @@ def search_semantic(config, conn, query, limit=10):
     results = []
     for sim, path, heading, content in scored[:limit]:
         snippet = content[:200].replace("\n", " ")
-        results.append({
-            "path": path,
-            "heading": heading or "",
-            "snippet": snippet,
-            "score": round(sim, 4),
-            "method": "semantic",
-        })
+        results.append(
+            {
+                "path": path,
+                "heading": heading or "",
+                "snippet": snippet,
+                "score": round(sim, 4),
+                "method": "semantic",
+            }
+        )
     return results
 
 
@@ -863,7 +916,9 @@ def cmd_status(config):
         if ollama_has_model(config):
             print(f" (model '{config.embed_model}' ready)")
         else:
-            print(f" (model '{config.embed_model}' NOT found — will auto-pull on index)")
+            print(
+                f" (model '{config.embed_model}' NOT found — will auto-pull on index)"
+            )
     else:
         print(" ✗ unreachable")
 
@@ -876,7 +931,9 @@ def cmd_status(config):
             exists = "✓" if Path(d).exists() else "✗"
             count = ""
             if conn:
-                n = conn.execute("SELECT COUNT(*) FROM files WHERE directory = ?", (d,)).fetchone()[0]
+                n = conn.execute(
+                    "SELECT COUNT(*) FROM files WHERE directory = ?", (d,)
+                ).fetchone()[0]
                 count = f" [{n} files]"
             print(f"  {exists} {d}{count}")
         if conn:
@@ -896,7 +953,9 @@ def main():
         prog="ownsearch",
         description="Smart full-text and semantic search for your local documents",
     )
-    parser.add_argument("--version", action="version", version=f"ownsearch {__version__}")
+    parser.add_argument(
+        "--version", action="version", version=f"ownsearch {__version__}"
+    )
     sub = parser.add_subparsers(dest="command")
 
     # add-dir
