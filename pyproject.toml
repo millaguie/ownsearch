@@ -1,13 +1,33 @@
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ownsearch"
 version = "0.1.0"
 description = "Smart full-text and semantic search for your local documents"
+readme = "README.md"
 requires-python = ">=3.10"
 license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Millaguie" },
+]
+keywords = ["search", "full-text-search", "semantic-search", "embeddings", "sqlite", "fts5", "ollama", "cli"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Utilities",
+    "Topic :: Text Processing :: Indexing",
+]
+
+[project.urls]
+Homepage = "https://github.com/millaguie/ownsearch"
+Repository = "https://github.com/millaguie/ownsearch"
+Issues = "https://github.com/millaguie/ownsearch/issues"
 
 [project.scripts]
 ownsearch = "ownsearch:main"
