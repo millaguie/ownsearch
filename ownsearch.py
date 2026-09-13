@@ -7,6 +7,7 @@ import math
 import os
 import re
 import sqlite3
+import subprocess
 import struct
 import sys
 import time
@@ -58,6 +59,12 @@ class Config:
             "db_path": str(DEFAULT_DB_PATH),
             "ollama_url": DEFAULT_OLLAMA_URL,
             "embed_model": DEFAULT_EMBED_MODEL,
+            # "ollama" (API nativa) o "openai" (/v1/embeddings, que habla
+            # cualquier gateway: LiteLLM, vLLM, OpenAI...).
+            "embed_backend": "ollama",
+            "embed_base_url": "",
+            "embed_api_key": "",
+            "embed_api_key_cmd": "",
             "directories": [],
             "extensions": list(INDEXABLE_EXTS),
             "skip_dirs": list(SKIP_DIRS),
@@ -80,6 +87,41 @@ class Config:
         return self.data["embed_model"]
 
     @property
+    def embed_backend(self):
+        return self.data.get("embed_backend", "ollama")
+
+    @property
+    def embed_base_url(self):
+        """Base del backend OpenAI-compatible, sin barra final."""
+        return (self.data.get("embed_base_url") or "").rstrip("/")
+
+    @property
+    def embed_api_key(self):
+        """Clave del backend OpenAI.
+
+        Por orden: variable de entorno, comando (para sacarla de `pass` sin
+        guardarla en el config) y, como ultimo recurso, el valor literal.
+        """
+        env = os.environ.get("OWNSEARCH_EMBED_API_KEY")
+        if env:
+            return env.strip()
+        cmd = self.data.get("embed_api_key_cmd")
+        if cmd:
+            try:
+                out = subprocess.run(
+                    cmd, shell=True, capture_output=True, text=True, timeout=15
+                )
+                if out.returncode == 0 and out.stdout.strip():
+                    return out.stdout.strip().splitlines()[0]
+                print(
+                    f"  Warning: embed_api_key_cmd fallo: {out.stderr.strip()[:120]}",
+                    file=sys.stderr,
+                )
+            except Exception as e:
+                print(f"  Warning: embed_api_key_cmd fallo: {e}", file=sys.stderr)
+        return (self.data.get("embed_api_key") or "").strip()
+
+    @property
     def directories(self):
         return [Path(d) for d in self.data["directories"]]
 
@@ -96,7 +138,18 @@ class Config:
 
 
 def ollama_available(config):
-    """Check if ollama server is reachable."""
+    """Check if the embedding backend is reachable."""
+    if config.embed_backend == "openai":
+        try:
+            req = urllib.request.Request(f"{config.embed_base_url}/models")
+            key = config.embed_api_key
+            if key:
+                req.add_header("Authorization", f"Bearer {key}")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                json.loads(resp.read())
+            return True
+        except Exception:
+            return False
     try:
         req = urllib.request.Request(f"{config.ollama_url}/api/tags")
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -108,6 +161,17 @@ def ollama_available(config):
 
 def ollama_has_model(config):
     """Check if the configured embedding model is available."""
+    if config.embed_backend == "openai":
+        try:
+            req = urllib.request.Request(f"{config.embed_base_url}/models")
+            key = config.embed_api_key
+            if key:
+                req.add_header("Authorization", f"Bearer {key}")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read())
+            return any(config.embed_model == m.get("id") for m in data.get("data", []))
+        except Exception:
+            return False
     try:
         req = urllib.request.Request(f"{config.ollama_url}/api/tags")
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -119,7 +183,17 @@ def ollama_has_model(config):
 
 
 def ollama_pull_model(config):
-    """Pull the embedding model. Returns True on success."""
+    """Pull the embedding model. Returns True on success.
+
+    Un backend OpenAI-compatible no descarga modelos: los sirve quien los tenga.
+    """
+    if config.embed_backend == "openai":
+        print(
+            f"  El backend openai no descarga modelos: publica '{config.embed_model}' "
+            f"en {config.embed_base_url} y vuelve a intentarlo.",
+            file=sys.stderr,
+        )
+        return False
     print(f"  Pulling model '{config.embed_model}' from ollama...")
     data = json.dumps({"name": config.embed_model, "stream": False}).encode()
     req = urllib.request.Request(
@@ -212,16 +286,28 @@ def _embed_request(config, input_data, retries=5):
     only wastes the backoff budget, so we bail immediately.
     """
     data = json.dumps({"model": config.embed_model, "input": input_data}).encode()
+    openai = config.embed_backend == "openai"
+    if openai:
+        url = f"{config.embed_base_url}/embeddings"
+        headers = {"Content-Type": "application/json"}
+        key = config.embed_api_key
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+    else:
+        url = f"{config.ollama_url}/api/embed"
+        headers = {"Content-Type": "application/json"}
 
     for attempt in range(retries + 1):
-        req = urllib.request.Request(
-            f"{config.ollama_url}/api/embed",
-            data=data,
-            headers={"Content-Type": "application/json"},
-        )
+        req = urllib.request.Request(url, data=data, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 result = json.loads(resp.read())
+            if openai:
+                # La API estandar devuelve [{"index": n, "embedding": [...]}, ...]
+                # y no garantiza el orden; el resto del codigo espera la lista
+                # alineada con los textos de entrada.
+                filas = sorted(result.get("data", []), key=lambda d: d.get("index", 0))
+                return [f["embedding"] for f in filas]
             return result.get("embeddings", [])
         except urllib.error.HTTPError as e:
             body = ""
@@ -910,7 +996,10 @@ def cmd_status(config):
     else:
         print(" (not created)")
 
-    print(f"\nOllama: {config.ollama_url}", end="")
+    destino = (
+        config.embed_base_url if config.embed_backend == "openai" else config.ollama_url
+    )
+    print(f"\nEmbeddings ({config.embed_backend}): {destino}", end="")
     if ollama_available(config):
         print(" ✓", end="")
         if ollama_has_model(config):
