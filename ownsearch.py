@@ -771,7 +771,7 @@ def cmd_index(args, config):
         except (OSError, PermissionError) as e:
             print(f"  Skip {path}: {e}", file=sys.stderr)
             continue
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             # Documento corrupto o no soportado. Se registra sin chunks para
             # no reintentar la conversion hasta que cambie el fichero.
             print(f"  Skip {path}: conversion failed: {e}", file=sys.stderr)
