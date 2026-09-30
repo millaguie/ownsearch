@@ -27,6 +27,26 @@ MAX_CHUNK_CHARS = 4000
 BATCH_SIZE = 5
 
 INDEXABLE_EXTS = {".md", ".txt", ".org", ".rst"}
+# Formatos que se convierten a Markdown con docvortex (extra opcional
+# `ownsearch[docs]`). Se indexan solos cuando docvortex esta instalado.
+DOCUMENT_EXTS = {
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".rtf",
+    ".ppt",
+    ".pptx",
+    ".xls",
+    ".xlsx",
+    ".odt",
+    ".ods",
+    ".odp",
+    ".html",
+    ".htm",
+    ".epub",
+    ".csv",
+    ".tsv",
+}
 SKIP_DIRS = {
     ".git",
     ".obsidian",
@@ -127,7 +147,10 @@ class Config:
 
     @property
     def extensions(self):
-        return set(self.data["extensions"])
+        exts = set(self.data["extensions"])
+        if docvortex_available():
+            exts |= DOCUMENT_EXTS
+        return exts
 
     @property
     def skip_dirs(self):
@@ -495,6 +518,46 @@ def cosine_sim(a, b):
     return dot / (na * nb)
 
 
+# --- Document conversion ---
+
+_docvortex = None
+
+
+def docvortex_available():
+    global _docvortex
+    if _docvortex is None:
+        try:
+            import docvortex
+            from loguru import logger
+
+            # docvortex saca trazas DEBUG por stderr en cada fichero.
+            logger.disable("docvortex")
+            _docvortex = docvortex
+        except ImportError:
+            _docvortex = False
+    return bool(_docvortex)
+
+
+def extract_text(path):
+    """Devuelve (texto, es_markdown). Los documentos pasan por docvortex."""
+    if path.suffix.lower() not in DOCUMENT_EXTS or not docvortex_available():
+        return path.read_text(encoding="utf-8", errors="replace"), path.suffix == ".md"
+    result = _docvortex.parse(path)
+    md = _docvortex.render_artifact(
+        result.middle_json, "markdown", assets=result.assets
+    ).content
+    if isinstance(md, bytes):
+        md = md.decode("utf-8", errors="replace")
+    # docvortex pone los titulos en negrita (`## **Titulo**`); sin esto el
+    # asterisco acaba en el heading de cada chunk.
+    md = re.sub(r"^(#{1,6}\s+)\*\*(.+?)\*\*\s*$", r"\1\2", md, flags=re.MULTILINE)
+    # Las imagenes no se extraen y el HTML en linea (<sup>, <strong>...) solo
+    # mete ruido en el indice y en los snippets.
+    md = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", md)
+    md = re.sub(r"</?[a-zA-Z][a-zA-Z0-9]*(\s[^<>]*)?/?>", "", md)
+    return md, True
+
+
 # --- File walking ---
 
 
@@ -505,7 +568,7 @@ def walk_directory(dir_path, extensions, skip_dirs):
         dirs[:] = [d for d in dirs if d not in skip_dirs]
         for f in files:
             p = Path(root) / f
-            if p.suffix in extensions:
+            if p.suffix.lower() in extensions:
                 rel = str(p.relative_to(dir_path))
                 st = p.stat()
                 yield str(p), rel, st.st_mtime_ns, st.st_size
@@ -702,20 +765,28 @@ def cmd_index(args, config):
 
     for i, path in enumerate(to_index, 1):
         full_path = Path(path)
+        dir_str, mtime_ns, size = current_files[path]
         try:
-            text = full_path.read_text(encoding="utf-8", errors="replace")
+            text, is_markdown = extract_text(full_path)
         except (OSError, PermissionError) as e:
             print(f"  Skip {path}: {e}", file=sys.stderr)
             continue
+        except Exception as e:  # noqa: BLE001
+            # Documento corrupto o no soportado. Se registra sin chunks para
+            # no reintentar la conversion hasta que cambie el fichero.
+            print(f"  Skip {path}: conversion failed: {e}", file=sys.stderr)
+            conn.execute(
+                "INSERT INTO files (path, directory, mtime_ns, size) VALUES (?, ?, ?, ?)",
+                (path, dir_str, mtime_ns, size),
+            )
+            continue
 
-        dir_str, mtime_ns, size = current_files[path]
         conn.execute(
             "INSERT INTO files (path, directory, mtime_ns, size) VALUES (?, ?, ?, ?)",
             (path, dir_str, mtime_ns, size),
         )
 
-        # Choose chunking strategy based on file type
-        if full_path.suffix == ".md":
+        if is_markdown:
             chunks = chunk_markdown(text)
         else:
             chunks = chunk_plaintext(text)

@@ -1,6 +1,6 @@
 # ownsearch
 
-Smart local search with full-text search (SQLite FTS5) and semantic search (embeddings via ollama). Zero external dependencies — Python stdlib only.
+Smart local search with full-text search (SQLite FTS5) and semantic search (embeddings via ollama). Zero external dependencies — Python stdlib only (document formats are an optional extra).
 
 ## Installation
 
@@ -85,9 +85,27 @@ Default: `.md`, `.txt`, `.org`, `.rst`
 
 Configurable in `~/.config/ownsearch/config.json` (`extensions` field).
 
+### Documents (PDF, Office, EPUB...)
+
+Install the `docs` extra to also index documents:
+
+```bash
+pipx install 'ownsearch[docs]'
+# or, if ownsearch is already installed with pipx:
+pipx inject ownsearch docvortex
+```
+
+With it, ownsearch converts these files to Markdown with [DocVortex](https://github.com/myhloli/DocVortex) and indexes them by heading: `.pdf`, `.doc`, `.docx`, `.rtf`, `.ppt`, `.pptx`, `.xls`, `.xlsx`, `.odt`, `.ods`, `.odp`, `.html`, `.htm`, `.epub`, `.csv`, `.tsv`.
+
+- No extra config: the formats are picked up on the next `ownsearch index`.
+- There is no OCR. Scanned PDFs give no text.
+- The extra is heavy (~500 MB, it pulls OpenCV and NumPy). Conversion is slower than reading text, but only changed files are converted again.
+- A file that fails to convert is skipped until it changes.
+
 ## Requirements
 
 - Python >= 3.10 (stdlib only, no external packages)
+- docvortex (optional, `ownsearch[docs]`, for PDF/Office/EPUB)
 - ollama (optional, for semantic search)
 
 ### Why bge-m3?

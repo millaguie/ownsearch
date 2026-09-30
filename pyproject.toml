@@ -29,6 +29,9 @@ Homepage = "https://github.com/millaguie/ownsearch"
 Repository = "https://github.com/millaguie/ownsearch"
 Issues = "https://github.com/millaguie/ownsearch/issues"
 
+[project.optional-dependencies]
+docs = ["docvortex>=0.5"]
+
 [project.scripts]
 ownsearch = "ownsearch:main"
 
