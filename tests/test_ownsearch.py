@@ -159,6 +159,43 @@ class TestMerge(unittest.TestCase):
         self.assertEqual(merged[1]["methods"], ["fts"])
 
 
+class TestDocuments(Base):
+    def fake_docvortex(self, outputs):
+        calls = []
+
+        def parse(path, **options):
+            calls.append(options)
+            return mock.Mock(middle_json=outputs[len(calls) - 1], assets=None)
+
+        def render(middle_json, fmt, assets=None):
+            return mock.Mock(content=middle_json)
+
+        fake = mock.Mock(parse=parse, render_artifact=render)
+        return fake, calls
+
+    def extract(self, name, outputs):
+        path = self.docs / name
+        path.write_bytes(b"%PDF-1.4")
+        fake, calls = self.fake_docvortex(outputs)
+        with (
+            mock.patch.object(ownsearch, "_docvortex", fake),
+            mock.patch.object(ownsearch, "docvortex_available", return_value=True),
+        ):
+            text, _ = ownsearch.extract_text(path)
+        return text, calls
+
+    def test_pdf_without_text_is_retried_with_ocr(self):
+        text, calls = self.extract(
+            "scan.pdf", ["![](images/p1.jpg)\n", "# Balance\n\nIngresos 1.200,00"]
+        )
+        self.assertEqual(calls, [{}, {"parse_mode": "ocr"}])
+        self.assertIn("Ingresos", text)
+
+    def test_pdf_with_text_is_not_retried(self):
+        text, calls = self.extract("ok.pdf", ["# Title\n\nPlenty of real text here."])
+        self.assertEqual(calls, [{}])
+
+
 class TestIndex(Base):
     def test_long_chunk_is_embedded_whole(self):
         seen = []

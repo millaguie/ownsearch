@@ -824,16 +824,32 @@ def docvortex_available():
     return bool(_docvortex)
 
 
-def extract_text(path):
-    """Devuelve (texto, es_markdown). Los documentos pasan por docvortex."""
-    if path.suffix.lower() not in DOCUMENT_EXTS or not docvortex_available():
-        return path.read_text(encoding="utf-8", errors="replace"), path.suffix == ".md"
-    result = _docvortex.parse(path)
+def _docvortex_markdown(path, **options):
+    result = _docvortex.parse(path, **options)
     md = _docvortex.render_artifact(
         result.middle_json, "markdown", assets=result.assets
     ).content
     if isinstance(md, bytes):
         md = md.decode("utf-8", errors="replace")
+    return md
+
+
+def _has_text(md):
+    """True si el Markdown tiene texto real, no solo enlaces a imagenes."""
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", md)
+    return len(re.sub(r"\W", "", text)) >= 20
+
+
+def extract_text(path):
+    """Devuelve (texto, es_markdown). Los documentos pasan por docvortex."""
+    if path.suffix.lower() not in DOCUMENT_EXTS or not docvortex_available():
+        return path.read_text(encoding="utf-8", errors="replace"), path.suffix == ".md"
+    md = _docvortex_markdown(path)
+    if path.suffix.lower() == ".pdf" and not _has_text(md):
+        # docvortex decide por PDF si hace falta OCR, y a veces se equivoca:
+        # PDFs con fuentes incrustadas raras dan solo imagenes. Se reintenta
+        # forzando OCR (solo los PDF admiten parse_mode).
+        md = _docvortex_markdown(path, parse_mode="ocr")
     # docvortex pone los titulos en negrita (`## **Titulo**`); sin esto el
     # asterisco acaba en el heading de cada chunk.
     md = re.sub(r"^(#{1,6}\s+)\*\*(.+?)\*\*\s*$", r"\1\2", md, flags=re.MULTILINE)
