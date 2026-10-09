@@ -250,6 +250,19 @@ class TestImages(Base):
         count = self.conn().execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
         self.assertEqual(count, 0)
 
+    def test_vlm_no_text_marker_leaves_no_chunks(self):
+        self.config.data["ocr_engine"] = "vlm"
+        self.image("doc.png")
+        with (
+            mock.patch.object(ownsearch, "_ocr_vlm", return_value="(sin texto)"),
+            mock.patch.object(ownsearch.Config, "images_enabled", return_value=True),
+            mock.patch("sys.stderr"),
+        ):
+            self.index(embed=False)
+        self.assertEqual(self.indexed(), ["doc.png"])
+        count = self.conn().execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        self.assertEqual(count, 0)
+
     def test_engine_problem_is_retried_next_run(self):
         self.image("doc.png")
 
