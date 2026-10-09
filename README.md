@@ -127,8 +127,8 @@ ownsearch list-dirs                            # shows [images] next to it
 
 Images under 8 KB are skipped. Two OCR engines:
 
-- `local` (default): the OCR models of docvortex, on the CPU, without network. Needs the `docs` extra. About 1-4 s per image.
-- `vlm`: a vision model behind an OpenAI-compatible `/v1/chat/completions` endpoint (for example Qwen-VL on vLLM or LiteLLM). Cleaner text and tables kept as Markdown. A vision model can also invent text, so check it on your own images first.
+- `local` (default): the OCR models of docvortex, on the CPU. Needs the `docs` extra. The first use downloads the models (~230 MB); after that it works without network. About 1-4 s per image.
+- `vlm`: a vision model behind an OpenAI-compatible `/v1/chat/completions` endpoint (for example Qwen-VL on vLLM or LiteLLM). Cleaner text and tables kept as Markdown. A vision model can also invent text, so check it on your own images first. With Pillow (it comes with the `docs` extra) images are reduced to 1600 px before sending; without it, only `.png`, `.jpg`, `.webp` and `.gif` under 5 MB are sent.
 
 ```bash
 ownsearch config set ocr_engine vlm
@@ -137,7 +137,7 @@ ownsearch config set ocr_model qwen3.8-27b
 ownsearch config set ocr_api_key_cmd 'pass show my/gateway-key'   # or OWNSEARCH_OCR_API_KEY
 ```
 
-If the endpoint does not answer, the image is skipped and retried on the next `ownsearch index`. Changing the engine does not redo the images already indexed: run `ownsearch index --full` for that.
+If the endpoint does not answer or the engine is not available, the image is skipped and retried on the next `ownsearch index`. An image that fails by itself (a corrupt file) is skipped until it changes. If the engine is turned off, images leave the index until it is back. Changing the engine does not redo the images already indexed: run `ownsearch index --full` for that.
 
 ### Fast semantic search (numpy)
 

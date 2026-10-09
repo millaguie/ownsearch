@@ -890,6 +890,15 @@ def docvortex_available():
     return bool(_docvortex)
 
 
+class OcrUnavailable(OSError):
+    """El motor de OCR no esta disponible (dependencia, version, Pillow).
+
+    Es un OSError para que index no registre la imagen y la reintente
+    cuando se arregle el motor. Un fallo de una imagen concreta (fichero
+    corrupto) sigue siendo un error normal y se registra sin chunks.
+    """
+
+
 def ocr_image(path, config):
     """Texto de una imagen con el motor de OCR configurado.
 
@@ -913,16 +922,16 @@ def _ocr_local(path):
     claro en vez de indexar mal.
     """
     if not docvortex_available():
-        raise RuntimeError("local OCR needs ownsearch[docs]")
+        raise OcrUnavailable("local OCR needs ownsearch[docs]")
     try:
         from docvortex.analyzers.ocr.pdf import _analyze_page
         from docvortex.analyzers.ocr.runtime import get_runtime
         from PIL import Image, ImageOps
     except ImportError as e:
-        raise RuntimeError(f"this docvortex version has no usable OCR: {e}") from e
+        raise OcrUnavailable(f"this docvortex version has no usable OCR: {e}") from e
     np_ = _numpy()
     if np_ is None:
-        raise RuntimeError("local OCR needs numpy")
+        raise OcrUnavailable("local OCR needs numpy")
     layout, text_model = get_runtime()
     with Image.open(path) as im:
         rgb = np_.asarray(ImageOps.exif_transpose(im).convert("RGB"))
@@ -939,20 +948,31 @@ def _ocr_local(path):
     return "\n\n".join(parts)
 
 
+# Formatos que un modelo con vision acepta tal cual, sin Pillow.
+VLM_RAW_MIME = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+VLM_RAW_MAX_BYTES = 5 * 1024 * 1024
+
+
 def _image_data_url(path):
     """Imagen como data URL. Con Pillow se reduce a 1600 px: una foto de
-    movil ocupa varios MB y el modelo no necesita tanto."""
+    movil ocupa varios MB y el modelo no necesita tanto. Sin Pillow solo se
+    envian tal cual los formatos web de menos de 5 MB."""
     try:
         from PIL import Image, ImageOps
-
+    except ImportError:
+        suffix = path.suffix.lower()
+        if suffix not in VLM_RAW_MIME or path.stat().st_size > VLM_RAW_MAX_BYTES:
+            raise OcrUnavailable(
+                f"{suffix} images over 5 MB or not web formats need Pillow"
+            ) from None
+        data, mime = path.read_bytes(), IMAGE_MIME[suffix]
+    else:
         with Image.open(path) as im:
             im = ImageOps.exif_transpose(im).convert("RGB")
             im.thumbnail((1600, 1600))
             buf = io.BytesIO()
             im.save(buf, "JPEG", quality=85)
         data, mime = buf.getvalue(), "image/jpeg"
-    except ImportError:
-        data, mime = path.read_bytes(), IMAGE_MIME.get(path.suffix.lower(), "image/png")
     return f"data:{mime};base64," + base64.b64encode(data).decode()
 
 
@@ -1220,7 +1240,8 @@ def cmd_index(args, config):
     images_ok = bool(config.image_dirs) and config.images_enabled()
     if config.image_dirs and not images_ok:
         print(
-            f"  Warning: OCR engine '{config.ocr_engine}' not available; images are skipped.",
+            f"  Warning: OCR engine '{config.ocr_engine}' not available; images are "
+            "left out of the index until it is.",
             file=sys.stderr,
         )
 
@@ -1656,9 +1677,12 @@ def clip_text(text, max_chars):
     """Corta en el ultimo espacio antes de max_chars, no a mitad de palabra."""
     if len(text) <= max_chars:
         return text
-    cut = text[:max_chars]
+    if max_chars <= 3:
+        return text[:max_chars]
+    # Los "..." cuentan dentro del limite.
+    cut = text[: max_chars - 3]
     space = cut.rfind(" ")
-    if space > max_chars // 2:
+    if space > len(cut) // 2:
         cut = cut[:space]
     return cut.rstrip() + "..."
 
@@ -1712,7 +1736,12 @@ def search_semantic(config, conn, query, limit=10, dir_prefix=None, max_chars=No
     # Un reintento: quien busca (a menudo un agente) espera la respuesta, y
     # los 5 de la indexacion suman un minuto de esperas con el backend caido.
     vectors = get_embeddings_batch(config, [query], retries=SEARCH_EMBED_RETRIES)
-    if not vectors or vectors[0] is PERMANENT_FAIL or not vectors[0]:
+    if vectors and vectors[0] is PERMANENT_FAIL:
+        # El backend responde, pero esta consulta no se puede embeber: no es
+        # una caida (codigo 3), es una consulta sin resultados semanticos.
+        print("Semantic search: this query cannot be embedded.", file=sys.stderr)
+        return []
+    if not vectors or not vectors[0]:
         print(
             "Semantic search unavailable (embedding backend not reachable, model missing, or query not embeddable).",
             file=sys.stderr,
@@ -1857,7 +1886,10 @@ def status_data(config):
             data["last_index"] = meta.get("last_index")
             if data["embeddings"]:
                 # Sin la clave, los embeddings son de 0.2.0 o anterior.
-                data["embed_max_chars"] = int(meta.get("embed_max_chars") or 2000)
+                try:
+                    data["embed_max_chars"] = int(meta.get("embed_max_chars") or 2000)
+                except ValueError:
+                    data["embed_max_chars"] = 2000
     finally:
         if conn:
             conn.close()

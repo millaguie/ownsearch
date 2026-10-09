@@ -142,8 +142,10 @@ class TestFts(Base):
         self.assertIsInstance(res[0]["chunk_id"], int)
 
     def test_clip_text_cuts_at_word(self):
-        self.assertEqual(ownsearch.clip_text("alpha beta gamma", 12), "alpha beta...")
+        self.assertEqual(ownsearch.clip_text("alpha beta gamma", 13), "alpha beta...")
         self.assertEqual(ownsearch.clip_text("short", 12), "short")
+        for n in range(1, 20):
+            self.assertLessEqual(len(ownsearch.clip_text("hola cilium network", n)), n)
 
 
 class TestMerge(unittest.TestCase):
@@ -240,6 +242,33 @@ class TestImages(Base):
         self.assertEqual(self.indexed(), [])
         self.index_with_ocr(lambda path, config: ("Ahora si", False))
         self.assertEqual(self.indexed(), ["doc.png"])
+
+    def test_engine_problem_is_retried_next_run(self):
+        self.image("doc.png")
+
+        def fail(path, config):
+            raise ownsearch.OcrUnavailable("docvortex changed")
+
+        self.index_with_ocr(fail)
+        self.assertEqual(self.indexed(), [])
+
+    def test_corrupt_image_is_not_retried(self):
+        self.image("doc.png")
+
+        def fail(path, config):
+            raise ValueError("cannot identify image")
+
+        self.index_with_ocr(fail)
+        self.assertEqual(self.indexed(), ["doc.png"])
+
+    def test_without_pillow_only_small_web_images_are_sent(self):
+        self.image("doc.png")
+        (self.docs / "scan.tif").write_bytes(b"II*\0" + b"\0" * 9000)
+        with mock.patch.dict("sys.modules", {"PIL": None}):
+            url = ownsearch._image_data_url(self.docs / "doc.png")
+            self.assertTrue(url.startswith("data:image/png;base64,"))
+            with self.assertRaises(ownsearch.OcrUnavailable):
+                ownsearch._image_data_url(self.docs / "scan.tif")
 
     def test_images_skipped_without_engine(self):
         self.image("doc.png")
@@ -588,6 +617,19 @@ class TestSemantic(Base):
                     self.config, self.conn(), "q", limit=5, dir_prefix=prefix
                 )
             self.assertEqual([Path(r["path"]).name for r in res], ["x.md"])
+
+    def test_unembeddable_query_is_empty_not_down(self):
+        with (
+            mock.patch.object(
+                ownsearch,
+                "get_embeddings_batch",
+                return_value=[ownsearch.PERMANENT_FAIL],
+            ),
+            mock.patch("sys.stderr"),
+        ):
+            self.assertEqual(
+                ownsearch.search_semantic(self.config, self.conn(), "q"), []
+            )
 
     def test_backend_down_is_none_not_empty(self):
         with (
