@@ -1,4 +1,7 @@
 import argparse
+import io
+import json
+import os
 import hashlib
 import sqlite3
 import tempfile
@@ -9,6 +12,8 @@ from pathlib import Path
 from unittest import mock
 
 import ownsearch
+
+HAS_NUMPY = ownsearch._numpy() is not None
 
 
 def fake_vec(text, dim=8):
@@ -105,6 +110,53 @@ class TestFts(Base):
 
     def test_negative_limit_returns_nothing(self):
         self.assertEqual(ownsearch.search_fts(self.conn(), "cilium", limit=-1), [])
+
+    def test_dir_filter_applies_before_limit(self):
+        other = self.root / "other"
+        other.mkdir()
+        for i in range(5):
+            (other / f"o{i}.md").write_text("# Cilium\n\ncilium cilium cilium\n")
+        self.config.data["directories"].append(str(other))
+        self.index(embed=False)
+        prefix = str(self.docs.resolve()) + os.sep
+        res = ownsearch.search_fts(self.conn(), "cilium", limit=2, dir_prefix=prefix)
+        self.assertEqual(self.paths(res), ["k8s.md"])
+
+    def test_dir_prefix_does_not_match_sibling_folder(self):
+        sibling = self.root / "docs-old"
+        sibling.mkdir()
+        (sibling / "s.md").write_text("# Cilium\n\ncilium\n")
+        self.config.data["directories"].append(str(sibling))
+        self.index(embed=False)
+        prefix = str(self.docs.resolve()) + os.sep
+        res = ownsearch.search_fts(self.conn(), "cilium", dir_prefix=prefix)
+        self.assertNotIn("s.md", self.paths(res))
+
+    def test_max_chars_returns_chunk_text(self):
+        res = ownsearch.search_fts(self.conn(), "cilium", max_chars=1000)
+        self.assertIn("Kubernetes cilium network policy.", res[0]["snippet"])
+
+    def test_results_have_mtime_and_chunk_id(self):
+        res = ownsearch.search_fts(self.conn(), "cilium")
+        self.assertRegex(res[0]["mtime"], r"^\d{4}-\d\d-\d\dT")
+        self.assertIsInstance(res[0]["chunk_id"], int)
+
+    def test_clip_text_cuts_at_word(self):
+        self.assertEqual(ownsearch.clip_text("alpha beta gamma", 12), "alpha beta...")
+        self.assertEqual(ownsearch.clip_text("short", 12), "short")
+
+
+class TestMerge(unittest.TestCase):
+    def r(self, chunk_id, method):
+        return ownsearch._result(chunk_id, "same.md", "Same heading", "x", 1.0, method)
+
+    def test_chunks_of_same_section_stay_separate(self):
+        merged = ownsearch.merge_results(
+            [self.r(1, "fts"), self.r(2, "fts")], [self.r(2, "semantic")]
+        )
+        self.assertEqual([m["chunk_id"] for m in merged], [2, 1])
+        self.assertEqual(merged[0]["methods"], ["fts", "semantic"])
+        self.assertEqual(merged[1]["methods"], ["fts"])
 
 
 class TestIndex(Base):
@@ -227,6 +279,24 @@ class TestIndex(Base):
         )
         self.assertEqual(unmarked, 0)
 
+    def test_chunk_overlap_only_changes_embedded_text(self):
+        seen = []
+
+        def embed(config, texts):
+            seen.extend(texts)
+            return [fake_vec(t) for t in texts]
+
+        self.config.data["chunk_overlap"] = 30
+        para_a = "alpha " * 500
+        para_b = "omega " * 500
+        self.write("two.txt", para_a + "\n\n" + para_b)
+        self.index(embed_fn=embed)
+        self.assertEqual(len(seen), 2)
+        self.assertTrue(seen[0].startswith("alpha"))
+        self.assertIn("alpha", seen[1][:40])
+        stored = [r[0] for r in self.conn().execute("SELECT content FROM chunks")]
+        self.assertTrue(stored[1].startswith("omega"))
+
     def test_workers_must_be_positive(self):
         with self.assertRaises(Exception):
             ownsearch._positive_int("0")
@@ -303,7 +373,7 @@ class TestSemantic(Base):
         with mock.patch.object(ownsearch, "np", None):
             self.assertEqual(len(self.search()), 5)
 
-    @unittest.skipIf(ownsearch.np is None, "numpy not installed")
+    @unittest.skipIf(not HAS_NUMPY, "numpy not installed")
     def test_python_and_numpy_agree(self):
         with mock.patch.object(ownsearch, "np", None):
             pure = self.search()
@@ -313,7 +383,7 @@ class TestSemantic(Base):
             self.assertAlmostEqual(a["score"], b["score"], places=3)
 
     def test_negative_limit_returns_nothing(self):
-        if ownsearch.np is not None:
+        if HAS_NUMPY:
             self.assertEqual(
                 ownsearch.top_chunks_numpy(
                     self.config.db_path, self.conn(), fake_vec("q"), -5
@@ -326,7 +396,7 @@ class TestSemantic(Base):
         with self.assertRaises(Exception):
             ownsearch._positive_int("-30")
 
-    @unittest.skipIf(ownsearch.np is None, "numpy not installed")
+    @unittest.skipIf(not HAS_NUMPY, "numpy not installed")
     def test_cache_detects_rewritten_vectors_with_same_ids(self):
         # Una version anterior que reindexa entero deja los mismos chunk_id.
         self.search()
@@ -342,7 +412,7 @@ class TestSemantic(Base):
             pure = self.search()
         self.assertEqual([r["path"] for r in self.search()], [r["path"] for r in pure])
 
-    @unittest.skipIf(ownsearch.np is None, "numpy not installed")
+    @unittest.skipIf(not HAS_NUMPY, "numpy not installed")
     def test_mixed_dimensions_use_the_query_dimension(self):
         # Mismo nombre de modelo en otro backend con otra dimension: la
         # mayoria de vectores viejos no debe tapar los del modelo actual.
@@ -361,13 +431,63 @@ class TestSemantic(Base):
         self.assertEqual(len(fast), 5)
         self.assertEqual([r["path"] for r in fast], [r["path"] for r in pure])
 
-    @unittest.skipIf(ownsearch.np is None, "numpy not installed")
+    def test_semantic_dir_filter(self):
+        other = self.root / "other"
+        other.mkdir()
+        (other / "x.md").write_text("# X\n\n" + "extra " * 20)
+        self.config.data["directories"].append(str(other))
+        self.index()
+        prefix = str(other.resolve()) + os.sep
+        for numpy_off in (True, False):
+            if not numpy_off and not HAS_NUMPY:
+                continue
+            with (
+                mock.patch.object(ownsearch, "np", None if numpy_off else ownsearch.np),
+                mock.patch.object(
+                    ownsearch, "get_embeddings_batch", return_value=[fake_vec("q")]
+                ),
+            ):
+                res = ownsearch.search_semantic(
+                    self.config, self.conn(), "q", limit=5, dir_prefix=prefix
+                )
+            self.assertEqual([Path(r["path"]).name for r in res], ["x.md"])
+
+    def test_backend_down_is_none_not_empty(self):
+        with (
+            mock.patch.object(ownsearch, "get_embeddings_batch", return_value=[]),
+            mock.patch("sys.stderr"),
+        ):
+            self.assertIsNone(ownsearch.search_semantic(self.config, self.conn(), "q"))
+
+    def test_search_exits_3_when_semantic_is_unavailable(self):
+        args = argparse.Namespace(
+            query=["topic1"],
+            semantic=False,
+            both=True,
+            strict=False,
+            json=True,
+            limit=5,
+            dir=None,
+            max_chars=None,
+        )
+        out = io.StringIO()
+        with (
+            mock.patch.object(ownsearch, "get_embeddings_batch", return_value=[]),
+            mock.patch("sys.stderr"),
+            mock.patch("sys.stdout", out),
+            self.assertRaises(SystemExit) as exit_,
+        ):
+            ownsearch.cmd_search(args, self.config)
+        self.assertEqual(exit_.exception.code, ownsearch.EXIT_SEMANTIC_UNAVAILABLE)
+        self.assertTrue(json.loads(out.getvalue()))
+
+    @unittest.skipIf(not HAS_NUMPY, "numpy not installed")
     def test_corrupt_cache_is_rebuilt(self):
         first = self.search()
         Path(self.config.data["db_path"] + ".ids.npy").write_bytes(b"")
         self.assertEqual(self.search(), first)
 
-    @unittest.skipIf(ownsearch.np is None, "numpy not installed")
+    @unittest.skipIf(not HAS_NUMPY, "numpy not installed")
     def test_cache_ignores_other_writer(self):
         # Una version anterior de ownsearch cambia embeddings sin vectors_rev.
         first = self.search()
@@ -381,7 +501,7 @@ class TestSemantic(Base):
         conn.commit()
         self.assertNotIn(top, [r["path"] for r in self.search()])
 
-    @unittest.skipIf(ownsearch.np is None, "numpy not installed")
+    @unittest.skipIf(not HAS_NUMPY, "numpy not installed")
     def test_cache_is_rebuilt_after_index_change(self):
         self.search()
         cache = Path(self.config.data["db_path"] + ".vectors.npy")

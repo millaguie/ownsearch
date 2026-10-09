@@ -59,6 +59,9 @@ ownsearch search --both "migration strategy"
 # Filter results by directory
 ownsearch search --dir ~/workspace/project "deploy"
 
+# Up to N characters of each matching chunk instead of a short snippet
+ownsearch search --json --max-chars 1500 "query"
+
 # JSON output (for integration with other tools/agents)
 ownsearch search --json "query"
 
@@ -67,6 +70,7 @@ ownsearch search --limit 5 "query"
 
 # Show status
 ownsearch status
+ownsearch status --json   # same, machine-readable (includes last index time)
 ```
 
 ## Directory management
@@ -85,6 +89,7 @@ ownsearch list-dirs         # List indexed directories
 - **Smart chunking**: Splits by markdown headings. Large files are partitioned into ~4000 char chunks while preserving heading context.
 - **Full-text fallback**: Full-text search first requires every word. If that finds nothing, it retries with any word, and BM25 usually ranks first the chunks with more of the words. Use `--strict` to turn this off. Matches in headings count double.
 - **Old embeddings**: Up to 0.2.0, embeddings used only the first 2000 characters of each chunk. `index` and `status` warn about it. Run `ownsearch index --full` once to rebuild them.
+- **Context across chunks** (optional): `ownsearch config set chunk_overlap 200` adds the last 200 characters of the previous chunk to the text that gets embedded. A section split in two keeps its context in both vectors. The stored text and the full-text index do not change. Run `ownsearch index --full` after changing it.
 - **Parallel indexing**: Embedding requests run in parallel (`--workers`, or `ownsearch config set embed_workers N`).
 - **Retry with backoff**: Embedding requests retry on failure with exponential backoff to handle transient server issues.
 
@@ -170,9 +175,15 @@ Prefer hybrid search with JSON output so you can parse hits programmatically:
 - `--both`     combine lexical + semantic, deduplicated (best default)
 - `--semantic` semantic only (related content with different wording)
 - (no flag)    fast literal FTS5 only
-- `--dir PATH` scope to one indexed directory
+- `--dir PATH` scope to one indexed directory (applied before `--limit`)
+- `--max-chars N` return up to N characters of each chunk, enough to quote it
 - `--limit N`  cap results
-- `--json`     machine-readable hits (file path + chunk); always use from a tool flow
+- `--json`     machine-readable hits; always use from a tool flow. Each hit has
+  `path`, `heading`, `snippet`, `score`, `method`, `chunk_id` and `mtime` (file
+  date, ISO 8601). With `--both`, `methods` says which searches found it; hits
+  found by both are usually the most relevant.
+- Exit code 3: semantic search was requested but the embedding backend is down.
+  The hits (if any) are full-text only.
 
 Each JSON hit gives the source file path and the matching chunk. Open the file to
 get full context before answering — this is retrieval only; reason over the results

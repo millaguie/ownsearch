@@ -13,15 +13,29 @@ import sys
 import time
 import urllib.request
 import urllib.error
+from datetime import datetime, timezone
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-try:
-    # Extra opcional `ownsearch[fast]`: busqueda semantica vectorizada.
-    import numpy as np
-except ImportError:
-    np = None
+# Extra opcional `ownsearch[fast]`: busqueda semantica vectorizada. Se
+# importa al primer uso: cuesta unos 80 ms, y una busqueda de texto (lo que
+# mas lanzan los agentes, un proceso por consulta) no lo necesita.
+_NP_UNSET = object()
+np = _NP_UNSET
+
+
+def _numpy():
+    """El modulo numpy, o None si no esta instalado."""
+    global np
+    if np is _NP_UNSET:
+        try:
+            import numpy
+        except ImportError:
+            numpy = None
+        np = numpy
+    return np
+
 
 __version__ = "0.2.0"
 
@@ -38,6 +52,9 @@ MAX_CHUNK_CHARS = 4000
 EMBED_MAX_CHARS = 8000
 BATCH_SIZE = 5
 DEFAULT_EMBED_WORKERS = 4
+# Codigo de salida de `search` cuando se pidio busqueda semantica y no se
+# pudo hacer.
+EXIT_SEMANTIC_UNAVAILABLE = 3
 # Peso de cada columna de chunks_fts en BM25: content, heading.
 BM25_WEIGHTS = (1.0, 2.0)
 
@@ -101,6 +118,7 @@ class Config:
             "embed_api_key": "",
             "embed_api_key_cmd": "",
             "embed_workers": DEFAULT_EMBED_WORKERS,
+            "chunk_overlap": 0,
             "directories": [],
             "extensions": list(INDEXABLE_EXTS),
             "skip_dirs": list(SKIP_DIRS),
@@ -171,6 +189,13 @@ class Config:
             return max(1, int(self.data.get("embed_workers", DEFAULT_EMBED_WORKERS)))
         except (TypeError, ValueError):
             return DEFAULT_EMBED_WORKERS
+
+    @property
+    def chunk_overlap(self):
+        try:
+            return max(0, int(self.data.get("chunk_overlap", 0)))
+        except (TypeError, ValueError):
+            return 0
 
     @property
     def directories(self):
@@ -561,6 +586,17 @@ def embeds_truncated_at(conn):
     return stored if stored < EMBED_MAX_CHARS else None
 
 
+def _set_last_index(conn):
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_index', ?)",
+        (_iso_now(),),
+    )
+
+
+def _iso_now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 def warn_truncated_embeds(conn):
     old = embeds_truncated_at(conn)
     if old is not None:
@@ -711,9 +747,12 @@ def load_vector_matrix(db_path, conn, dim):
     return mat, ids
 
 
-def top_chunks_numpy(db_path, conn, query_vec, limit):
-    """[(sim, chunk_id)] de los `limit` vectores mas parecidos."""
-    if limit < 1:
+def top_chunks_numpy(db_path, conn, query_vec, limit, allowed=None):
+    """[(sim, chunk_id)] de los `limit` vectores mas parecidos.
+
+    `allowed`: conjunto de chunk_ids entre los que buscar (filtro --dir).
+    """
+    if limit < 1 or _numpy() is None:
         return []
     q = np.asarray(query_vec, dtype=np.float32)
     mat, ids = load_vector_matrix(db_path, conn, q.shape[0])
@@ -723,7 +762,12 @@ def top_chunks_numpy(db_path, conn, query_vec, limit):
     if norm == 0:
         return []
     sims = mat @ (q / norm)
-    k = min(limit, len(sims))
+    candidates = len(sims)
+    if allowed is not None:
+        mask = np.isin(ids, np.fromiter(allowed, dtype=np.int64, count=len(allowed)))
+        sims = np.where(mask, sims, -np.inf)
+        candidates = int(mask.sum())
+    k = min(limit, candidates)
     if k < 1:
         return []
     top = np.argpartition(-sims, k - 1)[:k]
@@ -731,7 +775,7 @@ def top_chunks_numpy(db_path, conn, query_vec, limit):
     return [(float(sims[i]), int(ids[i])) for i in top]
 
 
-def top_chunks_python(conn, query_vec, limit):
+def top_chunks_python(conn, query_vec, limit, allowed=None):
     """Lo mismo que top_chunks_numpy, sin dependencias. Lento con mucho indice."""
     if limit < 1:
         return []
@@ -739,6 +783,8 @@ def top_chunks_python(conn, query_vec, limit):
     size = len(query_vec) * 4
     for chunk_id, vec_blob in conn.execute("SELECT chunk_id, vector FROM embeddings"):
         # Igual que la ruta numpy: los restos de otro modelo no se comparan.
+        if allowed is not None and chunk_id not in allowed:
+            continue
         if len(vec_blob) == size:
             scored.append((cosine_sim(query_vec, unpack_vector(vec_blob)), chunk_id))
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -888,20 +934,27 @@ def cmd_config_set(args, config):
     key = args.key
     value = args.value
 
-    valid_keys = {"db_path", "ollama_url", "embed_model", "embed_workers"}
+    valid_keys = {
+        "db_path",
+        "ollama_url",
+        "embed_model",
+        "embed_workers",
+        "chunk_overlap",
+    }
     if key not in valid_keys:
         print(
             f"Invalid key. Valid keys: {', '.join(sorted(valid_keys))}", file=sys.stderr
         )
         sys.exit(1)
 
-    if key == "embed_workers":
+    if key in ("embed_workers", "chunk_overlap"):
+        minimum = 1 if key == "embed_workers" else 0
         try:
             value = int(value)
-            if value < 1:
+            if value < minimum:
                 raise ValueError
         except ValueError:
-            print("embed_workers must be a positive integer", file=sys.stderr)
+            print(f"{key} must be an integer >= {minimum}", file=sys.stderr)
             sys.exit(1)
 
     old_value = config.data.get(key)
@@ -995,6 +1048,8 @@ def cmd_index(args, config):
 
     if not to_index and not to_remove:
         print("Index is up to date.")
+        _set_last_index(conn)
+        conn.commit()
         warn_truncated_embeds(conn)
         conn.close()
         return
@@ -1048,6 +1103,7 @@ def cmd_index(args, config):
             else:
                 chunks = chunk_plaintext(text)
 
+            prev_content = ""
             for idx, (heading, content) in enumerate(chunks):
                 cur = conn.execute(
                     "INSERT INTO chunks (file_path, chunk_index, heading, content) VALUES (?, ?, ?, ?)",
@@ -1055,9 +1111,11 @@ def cmd_index(args, config):
                 )
                 total_chunks += 1
                 if has_embeddings and len(content.strip()) >= 50:
-                    # Prefix heading for better embedding context
-                    embed_text = f"{heading}: {content}" if heading else content
+                    embed_text = embed_text_for(
+                        heading, content, prev_content, config.chunk_overlap
+                    )
                     embed_queue.append((cur.lastrowid, embed_text[:EMBED_MAX_CHARS]))
+                prev_content = content
 
                 if has_embeddings and len(embed_queue) >= BATCH_SIZE:
                     failed_ids += embedder.submit(embed_queue)
@@ -1083,6 +1141,7 @@ def cmd_index(args, config):
             conn.execute("UPDATE files SET mtime_ns = -1 WHERE path = ?", (path,))
         bump_vectors_rev(conn)
         conn.commit()
+        conn.close()
         raise
 
     # Any file with a failed embedding is unmarked (mtime_ns = -1) so the next
@@ -1103,6 +1162,7 @@ def cmd_index(args, config):
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_max_chars', ?)",
                 (str(EMBED_MAX_CHARS),),
             )
+    _set_last_index(conn)
     conn.commit()
     warn_truncated_embeds(conn)
     print(f"Done. {len(to_index)} files, {total_chunks} chunks indexed.")
@@ -1110,6 +1170,19 @@ def cmd_index(args, config):
         embed_count = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
         print(f"  Embeddings: {embed_count}")
     conn.close()
+
+
+def embed_text_for(heading, content, prev_content="", overlap=0):
+    """Texto que se embebe para un chunk.
+
+    Lleva delante el titulo y, con `chunk_overlap`, el final del chunk
+    anterior del mismo fichero: una idea partida en la frontera de dos
+    chunks queda en el vector de los dos. Solo afecta al vector; el texto
+    guardado y el indice de texto no se repiten.
+    """
+    if overlap and prev_content:
+        content = f"...{prev_content[-overlap:]}\n\n{content}"
+    return f"{heading}: {content}" if heading else content
 
 
 def _mark_for_retry(conn, chunk_ids):
@@ -1238,19 +1311,26 @@ def cmd_search(args, config):
         print("No query provided.", file=sys.stderr)
         sys.exit(1)
 
-    if args.semantic:
-        results = search_semantic(config, conn, query, args.limit)
-    elif args.both:
-        fts_results = search_fts(conn, query, args.limit, args.strict)
-        sem_results = search_semantic(config, conn, query, args.limit)
-        results = merge_results(fts_results, sem_results, args.limit)
-    else:
-        results = search_fts(conn, query, args.limit, args.strict)
-
-    # Apply directory filter if specified
+    dir_prefix = None
     if args.dir:
-        filter_dir = str(Path(args.dir).resolve())
-        results = [r for r in results if r["path"].startswith(filter_dir)]
+        # Con separador final: --dir ~/notes no debe incluir ~/notes-viejas.
+        dir_prefix = str(Path(args.dir).resolve()).rstrip(os.sep) + os.sep
+
+    degraded = False
+    if args.semantic or args.both:
+        sem_results = search_semantic(
+            config, conn, query, args.limit, dir_prefix, args.max_chars
+        )
+        degraded = sem_results is None
+        sem_results = sem_results or []
+    if args.semantic:
+        results = sem_results
+    else:
+        results = search_fts(
+            conn, query, args.limit, args.strict, dir_prefix, args.max_chars
+        )
+        if args.both:
+            results = merge_results(results, sem_results, args.limit)
 
     if args.json:
         print(json.dumps(results, ensure_ascii=False, indent=2))
@@ -1258,6 +1338,10 @@ def cmd_search(args, config):
         format_results(results, config)
 
     conn.close()
+    if degraded:
+        # La busqueda semantica pedida no se hizo: los resultados (si los
+        # hay) son solo de texto. Codigo propio para que un agente lo sepa.
+        sys.exit(EXIT_SEMANTIC_UNAVAILABLE)
 
 
 FTS_OPERATORS = {"AND", "OR", "NOT", "NEAR"}
@@ -1281,28 +1365,35 @@ def _has_fts_operators(query):
     return any(token in FTS_OPERATORS for token in query.split())
 
 
-def _fts_rows(conn, match, limit):
+def _fts_rows(conn, match, limit, dir_prefix=None):
     if limit < 1:
         # En SQLite, LIMIT negativo es "sin limite".
         return []
+    # El filtro de directorio va dentro de la consulta, antes del LIMIT: si
+    # se aplica despues, los N mejores de otras carpetas lo dejan vacio.
+    where_dir, params = "", [match]
+    if dir_prefix:
+        where_dir = "AND substr(c.file_path, 1, ?) = ?"
+        params += [len(dir_prefix), dir_prefix]
     try:
         return conn.execute(
             f"""
-            SELECT c.file_path, c.heading, snippet(chunks_fts, 0, '>>>', '<<<', '...', 40) as snip,
+            SELECT c.id, c.file_path, c.heading, c.content,
+                   snippet(chunks_fts, 0, '>>>', '<<<', '...', 40) as snip,
                    bm25(chunks_fts, {BM25_WEIGHTS[0]}, {BM25_WEIGHTS[1]}) as score
             FROM chunks_fts
             JOIN chunks c ON c.id = chunks_fts.rowid
-            WHERE chunks_fts MATCH ?
+            WHERE chunks_fts MATCH ? {where_dir}
             ORDER BY score
             LIMIT ?
             """,
-            (match, limit),
+            params + [limit],
         ).fetchall()
     except sqlite3.OperationalError:
         return None
 
 
-def search_fts(conn, query, limit=10, strict=False):
+def search_fts(conn, query, limit=10, strict=False, dir_prefix=None, max_chars=None):
     """Full-text search using FTS5 BM25.
 
     FTS5 exige todas las palabras. Si eso no da nada y no es `strict`, se
@@ -1315,41 +1406,98 @@ def search_fts(conn, query, limit=10, strict=False):
     strict = strict or _has_fts_operators(query)
     # La consulta tal cual admite sintaxis FTS5 (frases, prefijo*). Si no es
     # sintaxis valida o no da nada, se buscan las palabras sueltas con AND.
-    rows = _fts_rows(conn, query, limit)
+    rows = _fts_rows(conn, query, limit, dir_prefix)
     and_query = " ".join(terms)
     if rows is None:
         # Sintaxis invalida. Con operadores no se adivina: quitar un NOT
         # convertiria una exclusion en una inclusion.
-        rows = [] if _has_fts_operators(query) else _fts_rows(conn, and_query, limit)
+        rows = (
+            []
+            if _has_fts_operators(query)
+            else _fts_rows(conn, and_query, limit, dir_prefix)
+        )
     elif not rows and not strict and and_query != query:
-        rows = _fts_rows(conn, and_query, limit)
+        rows = _fts_rows(conn, and_query, limit, dir_prefix)
     if not rows and not strict and len(terms) > 1:
-        rows = _fts_rows(conn, " OR ".join(terms), limit)
+        rows = _fts_rows(conn, " OR ".join(terms), limit, dir_prefix)
 
     results = []
-    for path, heading, snippet_text, score in rows or []:
-        clean_snippet = snippet_text.replace(">>>", "").replace("<<<", "")
+    for chunk_id, path, heading, content, snippet_text, score in rows or []:
+        if max_chars:
+            snippet = clip_text(content, max_chars)
+        else:
+            snippet = snippet_text.replace(">>>", "").replace("<<<", "")
         results.append(
-            {
-                "path": path,
-                "heading": heading or "",
-                "snippet": clean_snippet,
-                "score": round(-score, 4),
-                "method": "fts",
-            }
+            _result(chunk_id, path, heading, snippet, round(-score, 4), "fts")
         )
+    _add_mtimes(conn, results)
     return results
 
 
-def search_semantic(config, conn, query, limit=10):
-    """Semantic search using embeddings."""
+def clip_text(text, max_chars):
+    """Corta en el ultimo espacio antes de max_chars, no a mitad de palabra."""
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    space = cut.rfind(" ")
+    if space > max_chars // 2:
+        cut = cut[:space]
+    return cut.rstrip() + "..."
+
+
+def _result(chunk_id, path, heading, snippet, score, method):
+    return {
+        "path": path,
+        "heading": heading or "",
+        "snippet": snippet,
+        "score": score,
+        "method": method,
+        "chunk_id": chunk_id,
+    }
+
+
+def _add_mtimes(conn, results):
+    """Anade a cada resultado la fecha del fichero (ISO 8601, UTC).
+
+    Un agente la usa para juzgar si el dato es reciente sin abrir el fichero.
+    Sale del indice; si el fichero esta marcado para reindexar (-1), del disco.
+    """
+    cache = {}
+    for r in results:
+        path = r["path"]
+        if path not in cache:
+            row = conn.execute(
+                "SELECT mtime_ns FROM files WHERE path = ?", (path,)
+            ).fetchone()
+            ns = row[0] if row else None
+            if ns is None or ns < 0:
+                try:
+                    ns = os.stat(path).st_mtime_ns
+                except OSError:
+                    ns = None
+            cache[path] = (
+                datetime.fromtimestamp(ns / 1e9, timezone.utc).isoformat(
+                    timespec="seconds"
+                )
+                if ns is not None
+                else None
+            )
+        r["mtime"] = cache[path]
+
+
+def search_semantic(config, conn, query, limit=10, dir_prefix=None, max_chars=None):
+    """Semantic search using embeddings.
+
+    Devuelve None si la busqueda no se pudo hacer (backend caido, modelo
+    ausente) para distinguirlo de "sin resultados".
+    """
     vectors = get_embeddings_batch(config, [query])
     if not vectors or vectors[0] is PERMANENT_FAIL or not vectors[0]:
         print(
-            "Semantic search unavailable (ollama not reachable, model missing, or query not embeddable).",
+            "Semantic search unavailable (embedding backend not reachable, model missing, or query not embeddable).",
             file=sys.stderr,
         )
-        return []
+        return None
 
     query_vec = vectors[0]
 
@@ -1357,10 +1505,22 @@ def search_semantic(config, conn, query, limit=10):
         print("No embeddings in index. Re-run: ownsearch index", file=sys.stderr)
         return []
 
-    if np is not None:
-        top = top_chunks_numpy(config.db_path, conn, query_vec, limit)
+    allowed = None
+    if dir_prefix:
+        allowed = {
+            row[0]
+            for row in conn.execute(
+                "SELECT id FROM chunks WHERE substr(file_path, 1, ?) = ?",
+                (len(dir_prefix), dir_prefix),
+            )
+        }
+        if not allowed:
+            return []
+
+    if _numpy() is not None:
+        top = top_chunks_numpy(config.db_path, conn, query_vec, limit, allowed)
     else:
-        top = top_chunks_python(conn, query_vec, limit)
+        top = top_chunks_python(conn, query_vec, limit, allowed)
 
     results = []
     for sim, chunk_id in top:
@@ -1370,42 +1530,43 @@ def search_semantic(config, conn, query, limit=10):
         if not row:
             continue
         path, heading, content = row
-        snippet = content[:200].replace("\n", " ")
+        if max_chars:
+            snippet = clip_text(content, max_chars)
+        else:
+            snippet = clip_text(content.replace("\n", " "), 200)
         results.append(
-            {
-                "path": path,
-                "heading": heading or "",
-                "snippet": snippet,
-                "score": round(sim, 4),
-                "method": "semantic",
-            }
+            _result(chunk_id, path, heading, snippet, round(sim, 4), "semantic")
         )
+    _add_mtimes(conn, results)
     return results
 
 
 def merge_results(fts_results, sem_results, limit=10):
-    """Merge results using reciprocal rank fusion."""
+    """Merge results using reciprocal rank fusion.
+
+    La clave es el chunk: los trozos de una seccion larga comparten fichero
+    y titulo, y con (path, heading) se fundian en uno. `methods` dice que
+    busquedas lo encontraron; si son las dos, suele ser lo mas relevante.
+    """
     K = 60
     scores = {}
     all_results = {}
+    methods = {}
 
-    for rank, r in enumerate(fts_results):
-        key = (r["path"], r["heading"])
-        scores[key] = scores.get(key, 0) + 1.0 / (K + rank + 1)
-        if key not in all_results:
-            all_results[key] = r
-
-    for rank, r in enumerate(sem_results):
-        key = (r["path"], r["heading"])
-        scores[key] = scores.get(key, 0) + 1.0 / (K + rank + 1)
-        if key not in all_results:
-            all_results[key] = r
+    for method, results in (("fts", fts_results), ("semantic", sem_results)):
+        for rank, r in enumerate(results):
+            key = r["chunk_id"]
+            scores[key] = scores.get(key, 0) + 1.0 / (K + rank + 1)
+            methods.setdefault(key, []).append(method)
+            if key not in all_results:
+                all_results[key] = r
 
     merged = []
     for key, r in all_results.items():
         r = r.copy()
         r["score"] = round(scores.get(key, 0), 4)
         r["method"] = "combined"
+        r["methods"] = methods[key]
         merged.append(r)
 
     merged.sort(key=lambda x: x["score"], reverse=True)
@@ -1427,12 +1588,67 @@ def format_results(results, config):
         print(f"\033[1;33m[{score:.2f}]\033[0m \033[1m{path}\033[0m")
         if heading:
             print(f"       \033[36m{heading}\033[0m")
-        print(f"       {snippet[:200]}")
+        print(f"       {snippet}")
         print()
 
 
-def cmd_status(config):
+def status_data(config):
+    """Estado en forma de dict, para `status --json`."""
+    if config.embed_backend == "openai":
+        url = config.embed_base_url
+    else:
+        url = config.ollama_url
+    reachable = ollama_available(config)
+    data = {
+        "version": __version__,
+        "db_path": str(config.db_path),
+        "db_bytes": None,
+        "embed_backend": config.embed_backend,
+        "embed_url": url,
+        "embed_reachable": reachable,
+        "embed_model": config.embed_model,
+        "embed_model_available": bool(reachable and ollama_has_model(config)),
+        "directories": [],
+        "chunks": 0,
+        "embeddings": 0,
+        "embed_max_chars": None,
+        "last_index": None,
+    }
+    conn = None
+    if config.db_path.exists():
+        data["db_bytes"] = config.db_path.stat().st_size
+        conn = sqlite3.connect(str(config.db_path))
+    try:
+        for d in config.data["directories"]:
+            files = None
+            if conn:
+                files = conn.execute(
+                    "SELECT COUNT(*) FROM files WHERE directory = ?", (d,)
+                ).fetchone()[0]
+            data["directories"].append(
+                {"path": d, "exists": Path(d).exists(), "files": files}
+            )
+        if conn:
+            data["chunks"] = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+            data["embeddings"] = conn.execute(
+                "SELECT COUNT(*) FROM embeddings"
+            ).fetchone()[0]
+            meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+            data["last_index"] = meta.get("last_index")
+            if data["embeddings"]:
+                # Sin la clave, los embeddings son de 0.2.0 o anterior.
+                data["embed_max_chars"] = int(meta.get("embed_max_chars") or 2000)
+    finally:
+        if conn:
+            conn.close()
+    return data
+
+
+def cmd_status(config, as_json=False):
     """Show status of ownsearch."""
+    if as_json:
+        print(json.dumps(status_data(config), ensure_ascii=False, indent=2))
+        return
     print(f"ownsearch v{__version__}")
     print(f"Config: {config.config_file}")
     print(f"Database: {config.db_path}", end="")
@@ -1539,6 +1755,11 @@ def main():
         "--limit", type=_positive_int, default=10, help="Max results (default: 10)"
     )
     srch.add_argument("--dir", help="Filter results to a specific directory")
+    srch.add_argument(
+        "--max-chars",
+        type=_positive_int,
+        help="Return up to N characters of each chunk instead of a short snippet",
+    )
 
     # config
     cfg = sub.add_parser("config", help="Show or set configuration")
@@ -1549,7 +1770,8 @@ def main():
     cfg_set.add_argument("value", help="Config value")
 
     # status
-    sub.add_parser("status", help="Show ownsearch status")
+    st = sub.add_parser("status", help="Show ownsearch status")
+    st.add_argument("--json", action="store_true", help="Output as JSON")
 
     args = parser.parse_args()
     config = Config()
@@ -1579,7 +1801,7 @@ def main():
         else:
             cmd_config_show(config)
     elif args.command == "status":
-        cmd_status(config)
+        cmd_status(config, args.json)
     else:
         parser.print_help()
 
