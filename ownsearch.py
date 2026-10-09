@@ -39,7 +39,7 @@ def _numpy():
     return np
 
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # Defaults
 DEFAULT_CONFIG_DIR = Path.home() / ".config" / "ownsearch"
