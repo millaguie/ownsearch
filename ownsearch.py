@@ -1169,14 +1169,18 @@ class _Embedder:
         return ids
 
     def _drain_one(self):
-        ids, future = self.pending.popleft()
+        # El lote sale de la cola cuando ya tiene resultado: si llega un
+        # Ctrl-C mientras se espera, abort() aun lo ve como pendiente.
+        ids, future = self.pending[0]
         try:
             vectors = future.result()
         except Exception as e:  # noqa: BLE001
             # Un fallo inesperado en un hilo no debe tirar la indexacion: el
             # lote cuenta como fallo transitorio y se reintenta en otro run.
             print(f"  Warning: embedding batch failed: {e}", file=sys.stderr)
+            self.pending.popleft()
             return list(ids)
+        self.pending.popleft()
         return _store_embed_batch(self.conn, ids, vectors)
 
 
@@ -1536,7 +1540,15 @@ def main():
     elif args.command == "list-dirs":
         cmd_list_dirs(config)
     elif args.command == "index":
-        cmd_index(args, config)
+        try:
+            cmd_index(args, config)
+        except KeyboardInterrupt:
+            # cmd_index ya guardo lo hecho y marco lo pendiente. Salir sin
+            # esperar a los hilos: una peticion de embeddings colgada puede
+            # tardar minutos en soltar.
+            print("\nInterrupted.", file=sys.stderr)
+            sys.stderr.flush()
+            os._exit(130)
     elif args.command == "search":
         cmd_search(args, config)
     elif args.command == "config":

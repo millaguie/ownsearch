@@ -175,6 +175,21 @@ class TestIndex(Base):
         for path, mtime, embeds in rows:
             self.assertTrue(mtime == -1 or embeds > 0, path)
 
+    def test_interrupt_while_waiting_for_a_batch(self):
+        for i in range(12):
+            self.write(f"n{i}.md", f"# Note {i}\n\n" + f"word{i} " * 20)
+
+        def embed(config, texts):
+            raise KeyboardInterrupt
+
+        with mock.patch("sys.stderr"), self.assertRaises(KeyboardInterrupt):
+            self.index(embed_fn=embed)
+        conn = self.conn()
+        unmarked = conn.execute(
+            "SELECT COUNT(*) FROM files WHERE mtime_ns != -1"
+        ).fetchone()[0]
+        self.assertEqual(unmarked, 0)
+
     def test_workers_must_be_positive(self):
         with self.assertRaises(Exception):
             ownsearch._positive_int("0")
