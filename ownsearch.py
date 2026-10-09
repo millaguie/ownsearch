@@ -55,6 +55,7 @@ DEFAULT_EMBED_WORKERS = 4
 # Codigo de salida de `search` cuando se pidio busqueda semantica y no se
 # pudo hacer.
 EXIT_SEMANTIC_UNAVAILABLE = 3
+SEARCH_EMBED_RETRIES = 1
 # Peso de cada columna de chunks_fts en BM25: content, heading.
 BM25_WEIGHTS = (1.0, 2.0)
 
@@ -322,7 +323,7 @@ class _PermanentFail(list):
 PERMANENT_FAIL = _PermanentFail()
 
 
-def get_embeddings_batch(config, texts):
+def get_embeddings_batch(config, texts, retries=5):
     """Get embeddings for a batch of texts from ollama. Truncates and retries on failure.
 
     Returns a list aligned with ``texts``; each item is the embedding vector, or
@@ -333,19 +334,22 @@ def get_embeddings_batch(config, texts):
     truncated = [t[:EMBED_MAX_CHARS] for t in texts]
 
     # Try batch first
-    embeddings = _embed_request(config, truncated)
+    embeddings = _embed_request(config, truncated, retries)
     if (
         embeddings is not PERMANENT_FAIL
         and embeddings
         and len(embeddings) == len(texts)
     ):
         return embeddings
+    if embeddings is not PERMANENT_FAIL and len(texts) == 1:
+        # Con un solo texto, probarlo "uno a uno" repetiria la misma peticion.
+        return [None]
 
     # Batch failed — fall back to one-by-one. A single poisoned text (NaN) makes
     # ollama 500 the whole batch, so isolating per-text salvages the rest.
     results = []
     for text in truncated:
-        vec = _embed_request(config, text)
+        vec = _embed_request(config, text, retries)
         if vec is PERMANENT_FAIL:
             results.append(PERMANENT_FAIL)
         elif vec:
@@ -1491,7 +1495,9 @@ def search_semantic(config, conn, query, limit=10, dir_prefix=None, max_chars=No
     Devuelve None si la busqueda no se pudo hacer (backend caido, modelo
     ausente) para distinguirlo de "sin resultados".
     """
-    vectors = get_embeddings_batch(config, [query])
+    # Un reintento: quien busca (a menudo un agente) espera la respuesta, y
+    # los 5 de la indexacion suman un minuto de esperas con el backend caido.
+    vectors = get_embeddings_batch(config, [query], retries=SEARCH_EMBED_RETRIES)
     if not vectors or vectors[0] is PERMANENT_FAIL or not vectors[0]:
         print(
             "Semantic search unavailable (embedding backend not reachable, model missing, or query not embeddable).",

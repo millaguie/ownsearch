@@ -175,7 +175,7 @@ class TestIndex(Base):
     def test_embed_request_gets_text_cut_at_max(self):
         sent = []
 
-        def request(config, texts):
+        def request(config, texts, retries=5):
             sent.extend(texts)
             return [fake_vec(t) for t in texts]
 
@@ -458,6 +458,20 @@ class TestSemantic(Base):
             mock.patch("sys.stderr"),
         ):
             self.assertIsNone(ownsearch.search_semantic(self.config, self.conn(), "q"))
+
+    def test_query_embedding_fails_fast(self):
+        calls = []
+
+        def request(config, data, retries=5):
+            calls.append(retries)
+            return []
+
+        with (
+            mock.patch.object(ownsearch, "_embed_request", side_effect=request),
+            mock.patch("sys.stderr"),
+        ):
+            self.assertIsNone(ownsearch.search_semantic(self.config, self.conn(), "q"))
+        self.assertEqual(calls, [ownsearch.SEARCH_EMBED_RETRIES])
 
     def test_search_exits_3_when_semantic_is_unavailable(self):
         args = argparse.Namespace(
