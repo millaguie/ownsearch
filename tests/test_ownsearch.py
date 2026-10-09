@@ -278,6 +278,21 @@ class TestImages(Base):
 
         self.index_with_ocr(fail)
         self.assertEqual(self.indexed(), [])
+        self.index_with_ocr(lambda path, config: ("Ahora si", False))
+        self.assertEqual(self.indexed(), ["doc.png"])
+
+    def test_config_error_stops_ocr_for_the_run(self):
+        self.image("a.png")
+        self.image("b.png")
+        calls = []
+
+        def fail(path, config):
+            calls.append(path)
+            raise ownsearch.OcrConfigError("HTTP 401")
+
+        self.index_with_ocr(fail)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.indexed(), [])
 
     @unittest.skipIf(not HAS_PIL, "Pillow not installed")
     def test_corrupt_image_is_not_retried(self):
@@ -755,6 +770,27 @@ class TestSemantic(Base):
             mock.patch("sys.stderr"),
         ):
             self.assertIsNone(ownsearch.search_semantic(self.config, self.conn(), "q"))
+
+    def test_query_embedding_http_attempts(self):
+        attempts = []
+
+        def urlopen(req, timeout):
+            attempts.append(1)
+            raise urllib.error.URLError("down")
+
+        with (
+            mock.patch("urllib.request.urlopen", side_effect=urlopen),
+            mock.patch("time.sleep"),
+            mock.patch("sys.stderr"),
+        ):
+            self.assertIsNone(ownsearch.search_semantic(self.config, self.conn(), "q"))
+        self.assertEqual(len(attempts), ownsearch.SEARCH_EMBED_RETRIES + 1)
+
+    def test_status_json_after_index_has_last_index(self):
+        with mock.patch.object(ownsearch, "ollama_available", return_value=False):
+            data = ownsearch.status_data(self.config)
+        self.assertRegex(data["last_index"], r"^\d{4}-\d\d-\d\dT")
+        self.assertEqual(data["embeddings"], 30)
 
     def test_query_embedding_fails_fast(self):
         calls = []

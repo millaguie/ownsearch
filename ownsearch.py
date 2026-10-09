@@ -256,7 +256,7 @@ class Config:
         """True si hay motor de OCR para las carpetas con imagenes."""
         if self.ocr_engine == "vlm":
             return bool(self.data.get("ocr_base_url") and self.data.get("ocr_model"))
-        return docvortex_available()
+        return docvortex_available() and _numpy() is not None
 
     @property
     def chunk_overlap(self):
@@ -891,6 +891,10 @@ def docvortex_available():
     return bool(_docvortex)
 
 
+class OcrConfigError(OSError):
+    """El endpoint de OCR rechaza la configuracion (clave, modelo, URL)."""
+
+
 class OcrUnavailable(OSError):
     """El motor de OCR no esta disponible (dependencia, version, Pillow).
 
@@ -940,7 +944,12 @@ def _ocr_local(path):
         # Cargar (o descargar) los modelos es cosa del motor, no de la
         # imagen: se reintenta. Un fallo al analizar la imagen, abajo, no.
         raise OcrUnavailable(f"local OCR models not available: {e}") from e
-    blocks, _ = _analyze_page(rgb, layout.predict(rgb), text_model, 0)
+    try:
+        blocks, _ = _analyze_page(rgb, layout.predict(rgb), text_model, 0)
+    except (TypeError, AttributeError) as e:
+        # Firma o resultado distintos: docvortex cambio sus funciones
+        # internas. Es del motor, no de la imagen; registrarla la perderia.
+        raise OcrUnavailable(f"docvortex OCR API changed: {e}") from e
     parts = []
     for block in blocks:
         content = block.get("content")
@@ -1032,6 +1041,11 @@ def _ocr_vlm(path, config):
             # es demasiado grande...). Reintentarla en cada index no la
             # arregla: ValueError la registra sin chunks hasta que cambie.
             raise ValueError(f"OCR endpoint rejected the image: HTTP {e.code}") from e
+        if e.code in (401, 403, 404):
+            raise OcrConfigError(
+                f"OCR endpoint refused the request (HTTP {e.code}): check "
+                "ocr_base_url, ocr_model and the API key"
+            ) from e
         raise
     except OSError:
         raise
@@ -1234,6 +1248,21 @@ def cmd_config_set(args, config):
             )
             sys.exit(1)
 
+    if key == "ocr_base_url" and value:
+        from urllib.parse import urlparse
+
+        url = urlparse(value)
+        if url.scheme != "https" and url.hostname not in (
+            "localhost",
+            "127.0.0.1",
+            "::1",
+        ):
+            print(
+                "  Warning: ocr_base_url is not HTTPS: images and the API key "
+                "travel unencrypted.",
+                file=sys.stderr,
+            )
+
     old_value = config.data.get(key)
     config.data[key] = value
     config.save()
@@ -1364,12 +1393,22 @@ def cmd_index(args, config):
     embedder = _Embedder(config, conn, workers) if has_embeddings else None
 
     path = None
+    ocr_off = False
     try:
         for i, path in enumerate(to_index, 1):
             full_path = Path(path)
             dir_str, mtime_ns, size = current_files[path]
+            if ocr_off and full_path.suffix.lower() in IMAGE_EXTS:
+                continue
             try:
                 text, is_markdown = extract_text(full_path, config)
+            except OcrConfigError as e:
+                # Clave caducada o modelo mal escrito: fallaran todas. Se
+                # deja el OCR para el siguiente run en vez de subir cada
+                # imagen para nada.
+                print(f"  {e}. Images are skipped in this run.", file=sys.stderr)
+                ocr_off = True
+                continue
             except (OSError, PermissionError) as e:
                 print(f"  Skip {path}: {e}", file=sys.stderr)
                 continue
@@ -1728,7 +1767,8 @@ def search_fts(conn, query, limit=10, strict=False, dir_prefix=None, max_chars=N
 
 
 def clip_text(text, max_chars):
-    """Corta en el ultimo espacio antes de max_chars, no a mitad de palabra."""
+    """Corta a max_chars como mucho, en el ultimo espacio si cae en la segunda
+    mitad del corte; si no (URL, codigo sin espacios), corta donde toque."""
     if len(text) <= max_chars:
         return text
     if max_chars <= 3:
