@@ -99,6 +99,13 @@ class TestFts(Base):
         res = ownsearch.search_fts(self.conn(), "kubernetes AND jamming")
         self.assertEqual(res, [])
 
+    def test_invalid_syntax_with_not_returns_nothing(self):
+        res = ownsearch.search_fts(self.conn(), 'radio NOT jamming "')
+        self.assertEqual(res, [])
+
+    def test_negative_limit_returns_nothing(self):
+        self.assertEqual(ownsearch.search_fts(self.conn(), "cilium", limit=-1), [])
+
 
 class TestIndex(Base):
     def test_long_chunk_is_embedded_whole(self):
@@ -108,10 +115,21 @@ class TestIndex(Base):
             seen.extend(texts)
             return [fake_vec(t) for t in texts]
 
-        self.write("long.txt", "x" * 3999)
+        # Un solo parrafo no se parte: el fragmento pasa de MAX_CHUNK_CHARS.
+        self.write("long.txt", "x" * 9000)
         self.index(embed_fn=embed)
-        self.assertEqual(len(seen[0]), 3999)
-        self.assertLess(ownsearch.MAX_CHUNK_CHARS, ownsearch.EMBED_MAX_CHARS)
+        self.assertEqual(len(seen[0]), ownsearch.EMBED_MAX_CHARS)
+
+    def test_embed_request_gets_text_cut_at_max(self):
+        sent = []
+
+        def request(config, texts):
+            sent.extend(texts)
+            return [fake_vec(t) for t in texts]
+
+        with mock.patch.object(ownsearch, "_embed_request", side_effect=request):
+            ownsearch.get_embeddings_batch(self.config, ["y" * 9000, "short"])
+        self.assertEqual([len(t) for t in sent], [ownsearch.EMBED_MAX_CHARS, 5])
 
     def test_parallel_index_stores_every_vector(self):
         threads = set()
@@ -188,6 +206,25 @@ class TestIndex(Base):
         unmarked = conn.execute(
             "SELECT COUNT(*) FROM files WHERE mtime_ns != -1"
         ).fetchone()[0]
+        self.assertEqual(unmarked, 0)
+
+    def test_interrupt_while_storing_a_batch(self):
+        for i in range(12):
+            self.write(f"n{i}.md", f"# Note {i}\n\n" + f"word{i} " * 20)
+
+        with (
+            mock.patch.object(
+                ownsearch, "_store_embed_batch", side_effect=KeyboardInterrupt
+            ),
+            mock.patch("sys.stderr"),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            self.index()
+        unmarked = (
+            self.conn()
+            .execute("SELECT COUNT(*) FROM files WHERE mtime_ns != -1")
+            .fetchone()[0]
+        )
         self.assertEqual(unmarked, 0)
 
     def test_workers_must_be_positive(self):
@@ -283,6 +320,9 @@ class TestSemantic(Base):
                 ),
                 [],
             )
+        self.assertEqual(
+            ownsearch.top_chunks_python(self.conn(), fake_vec("q"), -30), []
+        )
         with self.assertRaises(Exception):
             ownsearch._positive_int("-30")
 
@@ -301,6 +341,25 @@ class TestSemantic(Base):
         with mock.patch.object(ownsearch, "np", None):
             pure = self.search()
         self.assertEqual([r["path"] for r in self.search()], [r["path"] for r in pure])
+
+    @unittest.skipIf(ownsearch.np is None, "numpy not installed")
+    def test_mixed_dimensions_use_the_query_dimension(self):
+        # Mismo nombre de modelo en otro backend con otra dimension: la
+        # mayoria de vectores viejos no debe tapar los del modelo actual.
+        conn = self.conn()
+        ids = [r[0] for r in conn.execute("SELECT chunk_id FROM embeddings")]
+        for cid in ids[:20]:
+            conn.execute(
+                "UPDATE embeddings SET vector = ? WHERE chunk_id = ?",
+                (ownsearch.pack_vector([0.5] * 4), cid),
+            )
+        ownsearch.bump_vectors_rev(conn)
+        conn.commit()
+        with mock.patch.object(ownsearch, "np", None):
+            pure = self.search()
+        fast = self.search()
+        self.assertEqual(len(fast), 5)
+        self.assertEqual([r["path"] for r in fast], [r["path"] for r in pure])
 
     @unittest.skipIf(ownsearch.np is None, "numpy not installed")
     def test_corrupt_cache_is_rebuilt(self):

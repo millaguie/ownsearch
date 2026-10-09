@@ -642,8 +642,11 @@ def _load_cached_matrix(mat_path, ids_path):
     return mat, ids
 
 
-def load_vector_matrix(db_path, conn):
+def load_vector_matrix(db_path, conn, dim):
     """Matriz (n, dim) de vectores normalizados y sus chunk_ids, con numpy.
+
+    Solo entran los vectores de la dimension `dim`, la de la consulta: los
+    restos de otro modelo (mismo nombre, otro backend) no se comparan.
 
     Se guarda junto a la base de datos en dos .npy y se abre con mmap: leer
     y desempaquetar cien mil BLOBs en cada consulta cuesta mas que la propia
@@ -662,19 +665,20 @@ def load_vector_matrix(db_path, conn):
         cached_rev = None
     if rev is not None and cached_rev == rev:
         cached = _load_cached_matrix(mat_path, ids_path)
-        if cached is not None and _cache_matches_db(conn, *cached):
+        if (
+            cached is not None
+            and cached[0].shape[1] == dim
+            and _cache_matches_db(conn, *cached)
+        ):
             return cached
 
     rows = conn.execute("SELECT chunk_id, vector FROM embeddings").fetchall()
     if not rows:
         return np.zeros((0, 0), dtype=np.float32), np.zeros(0, dtype=np.int64)
-    # Con un solo modelo todos los vectores miden lo mismo; si hay restos de
-    # otro modelo, se usa la medida mas comun.
-    dims = {}
-    for _, blob in rows:
-        dims[len(blob)] = dims.get(len(blob), 0) + 1
-    size = max(dims, key=dims.get)
+    size = dim * 4
     rows = [r for r in rows if len(r[1]) == size]
+    if not rows:
+        return np.zeros((0, dim), dtype=np.float32), np.zeros(0, dtype=np.int64)
     ids = np.fromiter((r[0] for r in rows), dtype=np.int64, count=len(rows))
     mat = np.frombuffer(b"".join(r[1] for r in rows), dtype=np.float32)
     mat = mat.reshape(len(rows), size // 4).copy()
@@ -709,8 +713,10 @@ def load_vector_matrix(db_path, conn):
 
 def top_chunks_numpy(db_path, conn, query_vec, limit):
     """[(sim, chunk_id)] de los `limit` vectores mas parecidos."""
-    mat, ids = load_vector_matrix(db_path, conn)
+    if limit < 1:
+        return []
     q = np.asarray(query_vec, dtype=np.float32)
+    mat, ids = load_vector_matrix(db_path, conn, q.shape[0])
     if mat.shape[0] == 0 or mat.shape[1] != q.shape[0]:
         return []
     norm = np.linalg.norm(q)
@@ -727,6 +733,8 @@ def top_chunks_numpy(db_path, conn, query_vec, limit):
 
 def top_chunks_python(conn, query_vec, limit):
     """Lo mismo que top_chunks_numpy, sin dependencias. Lento con mucho indice."""
+    if limit < 1:
+        return []
     scored = []
     size = len(query_vec) * 4
     for chunk_id, vec_blob in conn.execute("SELECT chunk_id, vector FROM embeddings"):
@@ -1137,6 +1145,9 @@ class _Embedder:
     """
 
     def __init__(self, config, conn, workers):
+        if config.embed_backend == "openai":
+            # Resolver la clave aqui, en el hilo principal, antes de los hilos.
+            config.embed_api_key
         self.config = config
         self.conn = conn
         self.max_pending = workers * 2
@@ -1169,8 +1180,8 @@ class _Embedder:
         return ids
 
     def _drain_one(self):
-        # El lote sale de la cola cuando ya tiene resultado: si llega un
-        # Ctrl-C mientras se espera, abort() aun lo ve como pendiente.
+        # El lote sale de la cola cuando ya esta guardado: si llega un Ctrl-C
+        # mientras se espera, abort() aun lo ve como pendiente.
         ids, future = self.pending[0]
         try:
             vectors = future.result()
@@ -1180,8 +1191,11 @@ class _Embedder:
             print(f"  Warning: embedding batch failed: {e}", file=sys.stderr)
             self.pending.popleft()
             return list(ids)
+        # Tambien se guarda antes de sacarlo: si el guardado falla o llega
+        # un Ctrl-C, abort() lo marca para reintentar.
+        failed = _store_embed_batch(self.conn, ids, vectors)
         self.pending.popleft()
-        return _store_embed_batch(self.conn, ids, vectors)
+        return failed
 
 
 def _store_embed_batch(conn, ids, vectors):
@@ -1268,6 +1282,9 @@ def _has_fts_operators(query):
 
 
 def _fts_rows(conn, match, limit):
+    if limit < 1:
+        # En SQLite, LIMIT negativo es "sin limite".
+        return []
     try:
         return conn.execute(
             f"""
@@ -1300,7 +1317,11 @@ def search_fts(conn, query, limit=10, strict=False):
     # sintaxis valida o no da nada, se buscan las palabras sueltas con AND.
     rows = _fts_rows(conn, query, limit)
     and_query = " ".join(terms)
-    if rows is None or (not rows and not strict and and_query != query):
+    if rows is None:
+        # Sintaxis invalida. Con operadores no se adivina: quitar un NOT
+        # convertiria una exclusion en una inclusion.
+        rows = [] if _has_fts_operators(query) else _fts_rows(conn, and_query, limit)
+    elif not rows and not strict and and_query != query:
         rows = _fts_rows(conn, and_query, limit)
     if not rows and not strict and len(terms) > 1:
         rows = _fts_rows(conn, " OR ".join(terms), limit)
