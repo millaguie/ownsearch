@@ -583,13 +583,37 @@ def bump_vectors_rev(conn):
 
 
 def _vectors_rev(conn):
+    """Version de la tabla embeddings para validar la cache.
+
+    Ademas de vectors_rev lleva el numero de filas y el chunk_id maximo:
+    una version anterior de ownsearch (sin vectors_rev) que indexe sobre la
+    misma base de datos tambien invalida la cache.
+    """
     try:
         row = conn.execute(
             "SELECT value FROM meta WHERE key = 'vectors_rev'"
         ).fetchone()
+        count, max_id = conn.execute(
+            "SELECT COUNT(*), MAX(chunk_id) FROM embeddings"
+        ).fetchone()
     except sqlite3.OperationalError:
         return None
-    return row[0] if row else "0"
+    rev = row[0] if row and row[0] is not None else "0"
+    return f"{rev}:{count}:{max_id}"
+
+
+def _load_cached_matrix(mat_path, ids_path):
+    """Lee la cache; None si falta, esta corrupta o no cuadra."""
+    try:
+        mat = np.load(mat_path, mmap_mode="r")
+        ids = np.load(ids_path, mmap_mode="r")
+    except Exception:  # noqa: BLE001 - fichero truncado: EOFError, ValueError...
+        return None
+    if mat.ndim != 2 or ids.ndim != 1 or ids.dtype != np.int64:
+        return None
+    if mat.dtype != np.float32 or mat.shape[0] != ids.shape[0]:
+        return None
+    return mat, ids
 
 
 def load_vector_matrix(db_path, conn):
@@ -607,13 +631,13 @@ def load_vector_matrix(db_path, conn):
         base + ".vectors.rev",
     )
     try:
-        if rev is not None and Path(rev_path).read_text() == rev:
-            return (
-                np.load(mat_path, mmap_mode="r"),
-                np.load(ids_path, mmap_mode="r"),
-            )
-    except (OSError, ValueError):
-        pass
+        cached_rev = Path(rev_path).read_text()
+    except OSError:
+        cached_rev = None
+    if rev is not None and cached_rev == rev:
+        cached = _load_cached_matrix(mat_path, ids_path)
+        if cached is not None:
+            return cached
 
     rows = conn.execute("SELECT chunk_id, vector FROM embeddings").fetchall()
     if not rows:
@@ -633,9 +657,13 @@ def load_vector_matrix(db_path, conn):
     mat /= norms
 
     if rev is not None:
+        # Nombre temporal por proceso: dos busquedas a la vez pueden
+        # reconstruir la cache al mismo tiempo.
+        tmps = []
         try:
             for path, arr in ((mat_path, mat), (ids_path, ids)):
-                tmp = path + ".tmp"
+                tmp = f"{path}.{os.getpid()}.tmp"
+                tmps.append(tmp)
                 with open(tmp, "wb") as f:
                     np.save(f, arr)
                 os.replace(tmp, path)
@@ -645,6 +673,11 @@ def load_vector_matrix(db_path, conn):
                 f"  Warning: no se pudo guardar la cache de vectores: {e}",
                 file=sys.stderr,
             )
+            for tmp in tmps:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
     return mat, ids
 
 
@@ -1074,7 +1107,14 @@ class _Embedder:
 
     def _drain_one(self):
         ids, future = self.pending.popleft()
-        return _store_embed_batch(self.conn, ids, future.result())
+        try:
+            vectors = future.result()
+        except Exception as e:  # noqa: BLE001
+            # Un fallo inesperado en un hilo no debe tirar la indexacion: el
+            # lote cuenta como fallo transitorio y se reintenta en otro run.
+            print(f"  Warning: embedding batch failed: {e}", file=sys.stderr)
+            return list(ids)
+        return _store_embed_batch(self.conn, ids, vectors)
 
 
 def _store_embed_batch(conn, ids, vectors):
@@ -1171,10 +1211,11 @@ def search_fts(conn, query, limit=10, strict=False):
     """
     terms = _fts_terms(query)
     # La consulta tal cual admite sintaxis FTS5 (frases, prefijo*). Si no es
-    # sintaxis valida, se busca palabra a palabra.
+    # sintaxis valida o no da nada, se buscan las palabras sueltas con AND.
     rows = _fts_rows(conn, query, limit)
-    if rows is None and terms:
-        rows = _fts_rows(conn, " ".join(terms), limit)
+    and_query = " ".join(terms)
+    if not rows and terms and and_query != query:
+        rows = _fts_rows(conn, and_query, limit)
     if not rows and not strict and len(terms) > 1:
         rows = _fts_rows(conn, " OR ".join(terms), limit)
 
@@ -1336,6 +1377,16 @@ def cmd_status(config):
 # --- Main ---
 
 
+def _positive_int(value):
+    try:
+        n = int(value)
+    except ValueError:
+        n = 0
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer: {value}")
+    return n
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="ownsearch",
@@ -1362,7 +1413,7 @@ def main():
     idx.add_argument("--full", action="store_true", help="Force full re-index")
     idx.add_argument(
         "--workers",
-        type=int,
+        type=_positive_int,
         help=f"Parallel embedding requests (default: embed_workers, {DEFAULT_EMBED_WORKERS})",
     )
 

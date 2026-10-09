@@ -3,6 +3,7 @@ import hashlib
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -79,11 +80,16 @@ class TestFts(Base):
         self.assertEqual(self.paths(res), ["k8s.md"])
 
     def test_heading_weighs_more(self):
-        self.write("a.md", "# Notes\n\nSome text that mentions cilium once.\n")
-        self.write("b.md", "# Cilium\n\nSome text that mentions nothing else.\n")
+        # Mismas longitudes de columna: con pesos 1,1 empatan.
+        self.write("a.md", "# Notes\n\ncilium\n")
+        self.write("b.md", "# Cilium\n\nnotes\n")
+        # Relleno sin la palabra, para que su IDF no sea casi 0.
+        for i in range(8):
+            self.write(f"f{i}.md", f"# Filler {i}\n\nnothing here\n")
         self.index(embed=False)
         res = ownsearch.search_fts(self.conn(), "cilium")
-        self.assertEqual(self.paths(res)[0], "b.md")
+        self.assertEqual(self.paths(res)[:2], ["b.md", "a.md"])
+        self.assertGreater(res[0]["score"], res[1]["score"])
 
 
 class TestIndex(Base):
@@ -104,6 +110,7 @@ class TestIndex(Base):
 
         def embed(config, texts):
             threads.add(threading.get_ident())
+            time.sleep(0.01)
             return [fake_vec(t) for t in texts]
 
         for i in range(40):
@@ -115,11 +122,27 @@ class TestIndex(Base):
             "JOIN embeddings e ON e.chunk_id = c.id"
         ).fetchall()
         self.assertEqual(len(rows), 40)
+        self.assertGreater(len(threads), 1)
         for heading, content, blob in rows:
             expected = fake_vec(f"{heading}: {content}")
             got = ownsearch.unpack_vector(blob)
             for a, b in zip(expected, got):
                 self.assertAlmostEqual(a, b, places=5)
+
+    def test_worker_exception_is_a_transient_failure(self):
+        def embed(config, texts):
+            raise RuntimeError("boom")
+
+        self.write("a.md", "# A\n\n" + "alpha " * 20)
+        with mock.patch("sys.stderr"):
+            self.index(embed_fn=embed)
+        mtime = self.conn().execute("SELECT mtime_ns FROM files").fetchone()[0]
+        self.assertEqual(mtime, -1)
+
+    def test_workers_must_be_positive(self):
+        with self.assertRaises(Exception):
+            ownsearch._positive_int("0")
+        self.assertEqual(ownsearch._positive_int("3"), 3)
 
     def test_transient_failure_marks_file_for_retry(self):
         self.write("a.md", "# A\n\n" + "alpha " * 20)
@@ -179,16 +202,38 @@ class TestSemantic(Base):
         ):
             return ownsearch.search_semantic(self.config, self.conn(), "q", limit=5)
 
+    def test_python_search(self):
+        with mock.patch.object(ownsearch, "np", None):
+            self.assertEqual(len(self.search()), 5)
+
+    @unittest.skipIf(ownsearch.np is None, "numpy not installed")
     def test_python_and_numpy_agree(self):
         with mock.patch.object(ownsearch, "np", None):
             pure = self.search()
-        self.assertEqual(len(pure), 5)
-        if ownsearch.np is None:
-            self.skipTest("numpy not installed")
         fast = self.search()
         self.assertEqual([r["path"] for r in fast], [r["path"] for r in pure])
         for a, b in zip(fast, pure):
             self.assertAlmostEqual(a["score"], b["score"], places=3)
+
+    @unittest.skipIf(ownsearch.np is None, "numpy not installed")
+    def test_corrupt_cache_is_rebuilt(self):
+        first = self.search()
+        Path(self.config.data["db_path"] + ".ids.npy").write_bytes(b"")
+        self.assertEqual(self.search(), first)
+
+    @unittest.skipIf(ownsearch.np is None, "numpy not installed")
+    def test_cache_ignores_other_writer(self):
+        # Una version anterior de ownsearch cambia embeddings sin vectors_rev.
+        first = self.search()
+        conn = self.conn()
+        top = first[0]["path"]
+        conn.execute(
+            "DELETE FROM embeddings WHERE chunk_id IN "
+            "(SELECT id FROM chunks WHERE file_path = ?)",
+            (top,),
+        )
+        conn.commit()
+        self.assertNotIn(top, [r["path"] for r in self.search()])
 
     @unittest.skipIf(ownsearch.np is None, "numpy not installed")
     def test_cache_is_rebuilt_after_index_change(self):
