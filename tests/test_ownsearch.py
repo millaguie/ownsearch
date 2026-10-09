@@ -243,6 +243,13 @@ class TestImages(Base):
         self.index_with_ocr(lambda path, config: ("Ahora si", False))
         self.assertEqual(self.indexed(), ["doc.png"])
 
+    def test_image_without_text_has_no_chunks(self):
+        self.image("doc.png")
+        self.index_with_ocr(lambda path, config: ("", True))
+        self.assertEqual(self.indexed(), ["doc.png"])
+        count = self.conn().execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        self.assertEqual(count, 0)
+
     def test_engine_problem_is_retried_next_run(self):
         self.image("doc.png")
 

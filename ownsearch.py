@@ -1341,6 +1341,9 @@ def cmd_index(args, config):
                 chunks = chunk_markdown(text)
             else:
                 chunks = chunk_plaintext(text)
+            # Un OCR sin texto (o un fichero vacio) no deja chunks vacios: no
+            # aportan nada y ocupan sitio en los resultados.
+            chunks = [(h, c) for h, c in chunks if c.strip()]
 
             prev_content = ""
             for idx, (heading, content) in enumerate(chunks):
@@ -1868,7 +1871,7 @@ def status_data(config):
         data["db_bytes"] = config.db_path.stat().st_size
         conn = sqlite3.connect(str(config.db_path))
     try:
-        for d in config.data["directories"]:
+        for d in config.data.get("directories", []):
             files = None
             if conn:
                 files = conn.execute(
