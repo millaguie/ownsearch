@@ -137,7 +137,7 @@ ownsearch config set ocr_model qwen3.8-27b
 ownsearch config set ocr_api_key_cmd 'pass show my/gateway-key'   # or OWNSEARCH_OCR_API_KEY
 ```
 
-If the endpoint does not answer or the engine is not available, the image is skipped and retried on the next `ownsearch index`. An image that fails by itself (a corrupt file) is skipped until it changes. If the engine is turned off, images leave the index until it is back. Changing the engine does not redo the images already indexed: run `ownsearch index --full` for that.
+If the endpoint does not answer or the engine is not available, the image is skipped and retried on the next `ownsearch index`. An image that fails by itself (a corrupt file) is skipped until it changes. So is an image the endpoint rejects with HTTP 400, 413, 415 or 422. If every image fails with HTTP 400, check that the model accepts images, fix it and run `ownsearch index --full`. If the engine is turned off, images leave the index until it is back. Changing the engine does not redo the images already indexed: run `ownsearch index --full` for that.
 
 ### Fast semantic search (numpy)
 

@@ -1028,8 +1028,19 @@ def _ocr_vlm(path, config):
             # arregla: ValueError la registra sin chunks hasta que cambie.
             raise ValueError(f"OCR endpoint rejected the image: HTTP {e.code}") from e
         raise
+    except OSError:
+        raise
+    except Exception as e:  # noqa: BLE001 - IncompleteRead, BadStatusLine...
+        # Conexion cortada a mitad de respuesta: no es OSError, pero es un
+        # fallo del servicio y se reintenta.
+        raise OcrUnavailable(f"OCR response failed: {e}") from e
     try:
-        return json.loads(body)["choices"][0]["message"].get("content") or ""
+        content = json.loads(body)["choices"][0]["message"].get("content")
+        if content is None:
+            return ""
+        if not isinstance(content, str):
+            raise TypeError(f"content is {type(content).__name__}")
+        return content
     except (ValueError, KeyError, IndexError, TypeError, AttributeError) as e:
         # Un 200 sin la forma esperada (pagina de error de un proxy, JSON
         # cortado, {"error": ...}) es un problema del servicio, no de la
@@ -1905,11 +1916,14 @@ def status_data(config):
     if config.db_path.exists():
         data["db_bytes"] = config.db_path.stat().st_size
         conn = sqlite3.connect(str(config.db_path))
-        # Un fichero sin tablas (index cortado antes de crearlas) cuenta como
-        # indice vacio, no como error.
-        has_tables = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='files'"
-        ).fetchone()
+        # Un fichero sin tablas (index cortado antes de crearlas) o que no es
+        # SQLite cuenta como indice vacio, no como error.
+        try:
+            has_tables = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='files'"
+            ).fetchone()
+        except sqlite3.DatabaseError:
+            has_tables = None
         if not has_tables:
             conn.close()
             conn = None

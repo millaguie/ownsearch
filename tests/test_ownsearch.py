@@ -366,7 +366,12 @@ class TestImages(Base):
         )
         self.config._ocr_api_key = ""
         self.image("doc.png")
-        for body in (b"<html>oops</html>", b'{"error": "x"}', b'{"choices": []}'):
+        for body in (
+            b"<html>oops</html>",
+            b'{"error": "x"}',
+            b'{"choices": []}',
+            b'{"choices": [{"message": {"content": [{"type": "text"}]}}]}',
+        ):
             resp = mock.MagicMock()
             resp.__enter__.return_value.read.return_value = body
             with (
@@ -375,6 +380,23 @@ class TestImages(Base):
                 self.assertRaises(ownsearch.OcrUnavailable),
             ):
                 ownsearch.ocr_image(self.docs / "doc.png", self.config)
+
+    def test_vlm_cut_response_is_retried(self):
+        import http.client
+
+        self.config.data.update(
+            ocr_engine="vlm", ocr_base_url="http://gw/v1", ocr_model="m"
+        )
+        self.config._ocr_api_key = ""
+        self.image("doc.png")
+        resp = mock.MagicMock()
+        resp.__enter__.return_value.read.side_effect = http.client.IncompleteRead(b"")
+        with (
+            mock.patch.object(ownsearch, "_image_data_url", return_value="data:x"),
+            mock.patch("urllib.request.urlopen", return_value=resp),
+            self.assertRaises(ownsearch.OcrUnavailable),
+        ):
+            ownsearch.ocr_image(self.docs / "doc.png", self.config)
 
     def test_add_and_remove_image_dir(self):
         other = self.root / "pics"
@@ -707,6 +729,12 @@ class TestSemantic(Base):
         ):
             data = ownsearch.status_data(self.config)
         self.assertEqual(data["chunks"], 0)
+
+    def test_status_json_with_non_sqlite_file(self):
+        Path(self.config.data["db_path"] + ".junk").write_bytes(b"not a database" * 100)
+        self.config.data["db_path"] += ".junk"
+        with mock.patch.object(ownsearch, "ollama_available", return_value=False):
+            self.assertEqual(ownsearch.status_data(self.config)["chunks"], 0)
 
     def test_unembeddable_query_is_empty_not_down(self):
         with (
