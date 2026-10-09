@@ -128,6 +128,42 @@ class TestIndex(Base):
         self.assertEqual(mtime, -1)
 
 
+class TestTruncationWarning(Base):
+    def setUp(self):
+        super().setUp()
+        self.write("a.md", "# A\n\n" + "alpha " * 20)
+
+    def test_new_index_has_no_warning(self):
+        self.index()
+        self.assertIsNone(ownsearch.embeds_truncated_at(self.conn()))
+
+    def test_index_from_old_version_warns_until_full(self):
+        self.index()
+        conn = self.conn()
+        # Una base de datos de 0.2.0 no tiene embed_max_chars.
+        conn.execute("DELETE FROM meta WHERE key = 'embed_max_chars'")
+        conn.commit()
+        self.assertEqual(ownsearch.embeds_truncated_at(conn), 2000)
+
+        self.write("b.md", "# B\n\n" + "beta " * 20)
+        self.index()
+        self.assertEqual(ownsearch.embeds_truncated_at(conn), 2000)
+
+        with (
+            mock.patch.object(ownsearch, "ensure_embeddings_ready", return_value=True),
+            mock.patch.object(
+                ownsearch,
+                "get_embeddings_batch",
+                side_effect=lambda c, t: [fake_vec(x) for x in t],
+            ),
+            mock.patch("sys.stdout"),
+        ):
+            ownsearch.cmd_index(
+                argparse.Namespace(full=True, workers=None), self.config
+            )
+        self.assertIsNone(ownsearch.embeds_truncated_at(conn))
+
+
 class TestSemantic(Base):
     def setUp(self):
         super().setUp()

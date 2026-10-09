@@ -539,6 +539,37 @@ def unpack_vector(blob):
     return struct.unpack(f"{n}f", blob)
 
 
+def embeds_truncated_at(conn):
+    """Recorte con el que se hicieron los embeddings, si es menor que el actual.
+
+    Hasta 0.2.0 el recorte era de 2000 caracteres y no se guardaba. Devuelve
+    None si no hay embeddings o si ya se hicieron con EMBED_MAX_CHARS.
+    """
+    try:
+        if not conn.execute("SELECT 1 FROM embeddings LIMIT 1").fetchone():
+            return None
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'embed_max_chars'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    try:
+        stored = int(row[0]) if row else 2000
+    except ValueError:
+        stored = 2000
+    return stored if stored < EMBED_MAX_CHARS else None
+
+
+def warn_truncated_embeds(conn):
+    old = embeds_truncated_at(conn)
+    if old is not None:
+        print(
+            f"  Warning: embeddings were made with text cut at {old} characters "
+            f"(now {EMBED_MAX_CHARS}). Run 'ownsearch index --full' to rebuild them.",
+            file=sys.stderr,
+        )
+
+
 def bump_vectors_rev(conn):
     """Marca la cache de vectores como caducada.
 
@@ -854,6 +885,9 @@ def cmd_index(args, config):
 
     # Check embeddings availability (auto-pull if needed)
     has_embeddings = ensure_embeddings_ready(config)
+    # Sin embeddings previos (indice nuevo o modelo cambiado), todos los que
+    # se hagan ahora usan el recorte actual.
+    fresh_embeds = not conn.execute("SELECT 1 FROM embeddings LIMIT 1").fetchone()
 
     # Gather all current files across all directories
     current_files = {}  # absolute_path -> (dir_str, mtime_ns, size)
@@ -892,6 +926,7 @@ def cmd_index(args, config):
 
     if not to_index and not to_remove:
         print("Index is up to date.")
+        warn_truncated_embeds(conn)
         conn.close()
         return
 
@@ -990,7 +1025,13 @@ def cmd_index(args, config):
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_model', ?)",
             (config.embed_model,),
         )
+        if args.full or fresh_embeds:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_max_chars', ?)",
+                (str(EMBED_MAX_CHARS),),
+            )
     conn.commit()
+    warn_truncated_embeds(conn)
     print(f"Done. {len(to_index)} files, {total_chunks} chunks indexed.")
     if has_embeddings:
         embed_count = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
@@ -1286,6 +1327,7 @@ def cmd_status(config):
             total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
             embeds = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
             print(f"\n  Total: {total} chunks, {embeds} embeddings")
+            warn_truncated_embeds(conn)
             conn.close()
     else:
         print("  (none — use 'ownsearch add-dir PATH')")

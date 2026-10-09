@@ -84,6 +84,7 @@ ownsearch list-dirs         # List indexed directories
 - **Graceful degradation**: If ollama is unavailable, FTS5 search still works (semantic search is skipped).
 - **Smart chunking**: Splits by markdown headings. Large files are partitioned into ~4000 char chunks while preserving heading context.
 - **Full-text fallback**: Full-text search first requires every word. If that finds nothing, it retries with any word, and BM25 ranks first the chunks with more words. Use `--strict` to turn this off. Matches in headings count double.
+- **Old embeddings**: Up to 0.2.0, embeddings used only the first 2000 characters of each chunk. `index` and `status` warn about it. Run `ownsearch index --full` once to rebuild them.
 - **Parallel indexing**: Embedding requests run in parallel (`--workers`, or `ownsearch config set embed_workers N`).
 - **Retry with backoff**: Embedding requests retry on failure with exponential backoff to handle transient server issues.
 
