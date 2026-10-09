@@ -934,7 +934,12 @@ def _ocr_local(path):
     if np_ is None:
         raise OcrUnavailable("local OCR needs numpy")
     rgb = np_.asarray(_open_rgb(path, Image, ImageOps))
-    layout, text_model = get_runtime()
+    try:
+        layout, text_model = get_runtime()
+    except Exception as e:  # noqa: BLE001
+        # Cargar (o descargar) los modelos es cosa del motor, no de la
+        # imagen: se reintenta. Un fallo al analizar la imagen, abajo, no.
+        raise OcrUnavailable(f"local OCR models not available: {e}") from e
     blocks, _ = _analyze_page(rgb, layout.predict(rgb), text_model, 0)
     parts = []
     for block in blocks:
