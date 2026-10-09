@@ -1547,6 +1547,7 @@ def main():
             # esperar a los hilos: una peticion de embeddings colgada puede
             # tardar minutos en soltar.
             print("\nInterrupted.", file=sys.stderr)
+            sys.stdout.flush()
             sys.stderr.flush()
             os._exit(130)
     elif args.command == "search":
