@@ -319,6 +319,26 @@ class TestImages(Base):
             with self.assertRaises(ownsearch.OcrUnavailable):
                 ownsearch._image_data_url(self.docs / "scan.tif")
 
+    @unittest.skipIf(not (HAS_PIL and HAS_NUMPY), "Pillow and numpy needed")
+    def test_local_ocr_api_change_is_retried(self):
+        from PIL import Image
+
+        Image.new("RGB", (64, 64), "white").save(self.docs / "doc.png")
+        fake_pdf = mock.Mock(_analyze_page=mock.Mock(return_value=[]))
+        fake_runtime = mock.Mock(
+            get_runtime=mock.Mock(return_value=(mock.Mock(), mock.Mock()))
+        )
+        modules = {
+            "docvortex.analyzers.ocr.pdf": fake_pdf,
+            "docvortex.analyzers.ocr.runtime": fake_runtime,
+        }
+        with (
+            mock.patch.dict("sys.modules", modules),
+            mock.patch.object(ownsearch, "docvortex_available", return_value=True),
+            self.assertRaises(ownsearch.OcrUnavailable),
+        ):
+            ownsearch._ocr_local(self.docs / "doc.png")
+
     def test_images_skipped_without_engine(self):
         self.image("doc.png")
         with (

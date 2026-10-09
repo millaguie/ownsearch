@@ -945,11 +945,14 @@ def _ocr_local(path):
         # imagen: se reintenta. Un fallo al analizar la imagen, abajo, no.
         raise OcrUnavailable(f"local OCR models not available: {e}") from e
     try:
-        blocks, _ = _analyze_page(rgb, layout.predict(rgb), text_model, 0)
+        result = _analyze_page(rgb, layout.predict(rgb), text_model, 0)
     except (TypeError, AttributeError) as e:
-        # Firma o resultado distintos: docvortex cambio sus funciones
-        # internas. Es del motor, no de la imagen; registrarla la perderia.
+        # Firma distinta: docvortex cambio sus funciones internas. Es del
+        # motor, no de la imagen; registrarla la perderia.
         raise OcrUnavailable(f"docvortex OCR API changed: {e}") from e
+    if not (isinstance(result, tuple) and len(result) == 2):
+        raise OcrUnavailable("docvortex OCR API changed: unexpected result")
+    blocks = result[0]
     parts = []
     for block in blocks:
         content = block.get("content")

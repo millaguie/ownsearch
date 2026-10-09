@@ -114,7 +114,7 @@ With it, ownsearch converts these files to Markdown with [DocVortex](https://git
 - No extra config: the formats are picked up on the next `ownsearch index`.
 - Scanned PDFs go through OCR (docvortex detects them). If a PDF still gives no text, ownsearch retries it forcing OCR.
 - The extra is heavy (~500 MB, it pulls OpenCV and NumPy). Conversion is slower than reading text, but only changed files are converted again.
-- A file that fails to convert is skipped until it changes.
+- A file that fails to convert (also when forced OCR fails on it) is skipped until it changes. Run `ownsearch index --full` to try all files again.
 
 ### Images (OCR)
 
