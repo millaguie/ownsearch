@@ -76,7 +76,7 @@ ownsearch status --json   # same, machine-readable (includes last index time)
 ## Directory management
 
 ```bash
-ownsearch add-dir PATH      # Add a directory to the index
+ownsearch add-dir PATH      # Add a directory to the index (--images: also OCR its images)
 ownsearch remove-dir PATH   # Remove a directory and its data from the index
 ownsearch list-dirs         # List indexed directories
 ```
@@ -112,6 +112,32 @@ pipx inject ownsearch docvortex
 With it, ownsearch converts these files to Markdown with [DocVortex](https://github.com/myhloli/DocVortex) and indexes them by heading: `.pdf`, `.doc`, `.docx`, `.rtf`, `.ppt`, `.pptx`, `.xls`, `.xlsx`, `.odt`, `.ods`, `.odp`, `.html`, `.htm`, `.epub`, `.csv`, `.tsv`.
 
 - No extra config: the formats are picked up on the next `ownsearch index`.
+- Scanned PDFs go through OCR (docvortex detects them). If a PDF still gives no text, ownsearch retries it forcing OCR.
+- The extra is heavy (~500 MB, it pulls OpenCV and NumPy). Conversion is slower than reading text, but only changed files are converted again.
+- A file that fails to convert is skipped until it changes.
+
+### Images (OCR)
+
+Images (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.bmp`, `.tif`, `.tiff`) are indexed only in the directories you turn on, because most images in a wiki are screenshots and icons:
+
+```bash
+ownsearch add-dir ~/Documents/scans --images   # also works on a directory already added
+ownsearch list-dirs                            # shows [images] next to it
+```
+
+Images under 8 KB are skipped. Two OCR engines:
+
+- `local` (default): the OCR models of docvortex, on the CPU, without network. Needs the `docs` extra. About 1-4 s per image.
+- `vlm`: a vision model behind an OpenAI-compatible `/v1/chat/completions` endpoint (for example Qwen-VL on vLLM or LiteLLM). Cleaner text and tables kept as Markdown. A vision model can also invent text, so check it on your own images first.
+
+```bash
+ownsearch config set ocr_engine vlm
+ownsearch config set ocr_base_url https://your-gateway/v1
+ownsearch config set ocr_model qwen3.8-27b
+ownsearch config set ocr_api_key_cmd 'pass show my/gateway-key'   # or OWNSEARCH_OCR_API_KEY
+```
+
+If the endpoint does not answer, the image is skipped and retried on the next `ownsearch index`. Changing the engine does not redo the images already indexed: run `ownsearch index --full` for that.
 
 ### Fast semantic search (numpy)
 
@@ -124,9 +150,6 @@ pipx inject ownsearch numpy
 ```
 
 With numpy, semantic search keeps the vectors in a cache next to the database (`<db_path>.vectors.npy`) and compares them all in one matrix product. Without numpy, ownsearch compares them one by one in Python, which is slow beyond some tens of thousands of chunks.
-- There is no OCR. Scanned PDFs give no text.
-- The extra is heavy (~500 MB, it pulls OpenCV and NumPy). Conversion is slower than reading text, but only changed files are converted again.
-- A file that fails to convert is skipped until it changes.
 
 ## Requirements
 

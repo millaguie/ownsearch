@@ -196,6 +196,106 @@ class TestDocuments(Base):
         self.assertEqual(calls, [{}])
 
 
+class TestImages(Base):
+    def setUp(self):
+        super().setUp()
+        self.config.data["image_dirs"] = [str(self.docs.resolve())]
+        self.config.data["directories"] = [str(self.docs.resolve())]
+
+    def image(self, name, size=9000):
+        (self.docs / name).write_bytes(b"\x89PNG" + b"\0" * size)
+
+    def index_with_ocr(self, ocr):
+        with (
+            mock.patch.object(ownsearch, "ocr_image", side_effect=ocr),
+            mock.patch.object(ownsearch.Config, "images_enabled", return_value=True),
+            mock.patch("sys.stderr"),
+        ):
+            self.index(embed=False)
+
+    def indexed(self):
+        return sorted(
+            Path(r[0]).name for r in self.conn().execute("SELECT path FROM files")
+        )
+
+    def test_images_only_in_enabled_dirs_and_not_tiny(self):
+        other = self.root / "other"
+        other.mkdir()
+        (other / "o.png").write_bytes(b"\x89PNG" + b"\0" * 9000)
+        self.config.data["directories"].append(str(other.resolve()))
+        self.image("doc.png")
+        self.image("icon.png", size=100)
+        self.index_with_ocr(lambda path, config: ("Factura numero 42", False))
+        self.assertEqual(self.indexed(), ["doc.png"])
+        res = ownsearch.search_fts(self.conn(), "factura")
+        self.assertEqual([Path(r["path"]).name for r in res], ["doc.png"])
+
+    def test_network_failure_is_retried_next_run(self):
+        self.image("doc.png")
+
+        def fail(path, config):
+            raise OSError("gateway down")
+
+        self.index_with_ocr(fail)
+        self.assertEqual(self.indexed(), [])
+        self.index_with_ocr(lambda path, config: ("Ahora si", False))
+        self.assertEqual(self.indexed(), ["doc.png"])
+
+    def test_images_skipped_without_engine(self):
+        self.image("doc.png")
+        with (
+            mock.patch.object(ownsearch.Config, "images_enabled", return_value=False),
+            mock.patch("sys.stderr"),
+        ):
+            self.index(embed=False)
+        self.assertEqual(self.indexed(), [])
+
+    def test_vlm_request(self):
+        self.config.data.update(
+            ocr_engine="vlm",
+            ocr_base_url="http://gw/v1/",
+            ocr_model="qwen-vl",
+        )
+        self.config._ocr_api_key = "k"
+        sent = {}
+
+        def urlopen(req, timeout):
+            sent["url"] = req.full_url
+            sent["auth"] = req.get_header("Authorization")
+            sent["body"] = json.loads(req.data)
+            resp = mock.MagicMock()
+            resp.__enter__.return_value.read.return_value = json.dumps(
+                {"choices": [{"message": {"content": "(sin texto)"}}]}
+            ).encode()
+            return resp
+
+        self.image("doc.png")
+        with (
+            mock.patch.object(ownsearch, "_image_data_url", return_value="data:x"),
+            mock.patch("urllib.request.urlopen", side_effect=urlopen),
+        ):
+            text, is_md = ownsearch.ocr_image(self.docs / "doc.png", self.config)
+        self.assertEqual(text, "")
+        self.assertEqual(sent["url"], "http://gw/v1/chat/completions")
+        self.assertEqual(sent["auth"], "Bearer k")
+        self.assertEqual(sent["body"]["model"], "qwen-vl")
+        content = sent["body"]["messages"][0]["content"]
+        self.assertEqual(content[1]["image_url"]["url"], "data:x")
+
+    def test_add_and_remove_image_dir(self):
+        other = self.root / "pics"
+        other.mkdir()
+        self.config.save = lambda: None
+        with mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+            ownsearch.cmd_add_dir(
+                argparse.Namespace(path=str(other), images=True), self.config
+            )
+        self.assertIn(str(other.resolve()), self.config.image_dirs)
+        with mock.patch("sys.stdout"):
+            ownsearch.cmd_remove_dir(argparse.Namespace(path=str(other)), self.config)
+        self.assertNotIn(str(other.resolve()), self.config.image_dirs)
+
+
 class TestIndex(Base):
     def test_long_chunk_is_embedded_whole(self):
         seen = []

@@ -2,6 +2,8 @@
 """ownsearch — Smart full-text and semantic search across your local documents."""
 
 import argparse
+import base64
+import io
 import json
 import math
 import os
@@ -80,6 +82,26 @@ DOCUMENT_EXTS = {
     ".csv",
     ".tsv",
 }
+# Imagenes: solo en las carpetas activadas con `add-dir --images`, porque en
+# una wiki la mayoria son capturas e iconos.
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+# Por debajo de esto suelen ser iconos o adornos sin texto util.
+IMAGE_MIN_BYTES = 8 * 1024
+IMAGE_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+}
+OCR_PROMPT = (
+    "Transcribe todo el texto de esta imagen, tal cual, en Markdown. "
+    "Respeta tablas y titulos. No resumas ni comentes. "
+    "Si no hay texto, responde exactamente: (sin texto)"
+)
 SKIP_DIRS = {
     ".git",
     ".obsidian",
@@ -120,6 +142,13 @@ class Config:
             "embed_api_key_cmd": "",
             "embed_workers": DEFAULT_EMBED_WORKERS,
             "chunk_overlap": 0,
+            # Carpetas con OCR de imagenes y motor: "local" (docvortex, sin
+            # red) o "vlm" (modelo con vision por API compatible con OpenAI).
+            "image_dirs": [],
+            "ocr_engine": "local",
+            "ocr_base_url": "",
+            "ocr_model": "",
+            "ocr_api_key_cmd": "",
             "directories": [],
             "extensions": list(INDEXABLE_EXTS),
             "skip_dirs": list(SKIP_DIRS),
@@ -190,6 +219,43 @@ class Config:
             return max(1, int(self.data.get("embed_workers", DEFAULT_EMBED_WORKERS)))
         except (TypeError, ValueError):
             return DEFAULT_EMBED_WORKERS
+
+    @property
+    def image_dirs(self):
+        return set(self.data.get("image_dirs") or [])
+
+    @property
+    def ocr_engine(self):
+        return self.data.get("ocr_engine") or "local"
+
+    @property
+    def ocr_api_key(self):
+        """Clave del modelo de OCR: variable de entorno o comando, una vez."""
+        if not hasattr(self, "_ocr_api_key"):
+            key = os.environ.get("OWNSEARCH_OCR_API_KEY", "").strip()
+            cmd = self.data.get("ocr_api_key_cmd")
+            if not key and cmd:
+                try:
+                    out = subprocess.run(
+                        cmd, shell=True, capture_output=True, text=True, timeout=15
+                    )
+                    if out.returncode == 0 and out.stdout.strip():
+                        key = out.stdout.strip().splitlines()[0]
+                    else:
+                        print(
+                            f"  Warning: ocr_api_key_cmd fallo: {out.stderr.strip()[:120]}",
+                            file=sys.stderr,
+                        )
+                except Exception as e:  # noqa: BLE001
+                    print(f"  Warning: ocr_api_key_cmd fallo: {e}", file=sys.stderr)
+            self._ocr_api_key = key
+        return self._ocr_api_key
+
+    def images_enabled(self):
+        """True si hay motor de OCR para las carpetas con imagenes."""
+        if self.ocr_engine == "vlm":
+            return bool(self.data.get("ocr_base_url") and self.data.get("ocr_model"))
+        return docvortex_available()
 
     @property
     def chunk_overlap(self):
@@ -824,6 +890,101 @@ def docvortex_available():
     return bool(_docvortex)
 
 
+def ocr_image(path, config):
+    """Texto de una imagen con el motor de OCR configurado.
+
+    Un fallo de red (OSError) no registra el fichero: se reintenta en el
+    siguiente index.
+    """
+    if config is not None and config.ocr_engine == "vlm":
+        text = _ocr_vlm(path, config)
+        if text.strip() == "(sin texto)":
+            text = ""
+        return text, True
+    return _ocr_local(path), False
+
+
+def _ocr_local(path):
+    """OCR con los modelos de docvortex, directamente sobre la imagen.
+
+    docvortex no acepta imagenes como documento, asi que se usan sus piezas
+    de OCR de PDF (deteccion de bloques y reconocimiento de lineas). Son
+    funciones internas: si cambian en otra version, falla aqui con un error
+    claro en vez de indexar mal.
+    """
+    if not docvortex_available():
+        raise RuntimeError("local OCR needs ownsearch[docs]")
+    try:
+        from docvortex.analyzers.ocr.pdf import _analyze_page
+        from docvortex.analyzers.ocr.runtime import get_runtime
+        from PIL import Image, ImageOps
+    except ImportError as e:
+        raise RuntimeError(f"this docvortex version has no usable OCR: {e}") from e
+    np_ = _numpy()
+    if np_ is None:
+        raise RuntimeError("local OCR needs numpy")
+    layout, text_model = get_runtime()
+    with Image.open(path) as im:
+        rgb = np_.asarray(ImageOps.exif_transpose(im).convert("RGB"))
+    blocks, _ = _analyze_page(rgb, layout.predict(rgb), text_model, 0)
+    parts = []
+    for block in blocks:
+        content = block.get("content")
+        if isinstance(content, list):
+            content = "".join(
+                c.get("content", "") if isinstance(c, dict) else str(c) for c in content
+            )
+        if content:
+            parts.append(str(content))
+    return "\n\n".join(parts)
+
+
+def _image_data_url(path):
+    """Imagen como data URL. Con Pillow se reduce a 1600 px: una foto de
+    movil ocupa varios MB y el modelo no necesita tanto."""
+    try:
+        from PIL import Image, ImageOps
+
+        with Image.open(path) as im:
+            im = ImageOps.exif_transpose(im).convert("RGB")
+            im.thumbnail((1600, 1600))
+            buf = io.BytesIO()
+            im.save(buf, "JPEG", quality=85)
+        data, mime = buf.getvalue(), "image/jpeg"
+    except ImportError:
+        data, mime = path.read_bytes(), IMAGE_MIME.get(path.suffix.lower(), "image/png")
+    return f"data:{mime};base64," + base64.b64encode(data).decode()
+
+
+def _ocr_vlm(path, config):
+    """OCR con un modelo con vision por /v1/chat/completions."""
+    base = config.data.get("ocr_base_url", "").rstrip("/")
+    body = {
+        "model": config.data.get("ocr_model"),
+        "temperature": 0,
+        "max_tokens": 4000,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": OCR_PROMPT},
+                    {"type": "image_url", "image_url": {"url": _image_data_url(path)}},
+                ],
+            }
+        ],
+    }
+    headers = {"Content-Type": "application/json"}
+    key = config.ocr_api_key
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    req = urllib.request.Request(
+        f"{base}/chat/completions", data=json.dumps(body).encode(), headers=headers
+    )
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        result = json.loads(resp.read())
+    return result["choices"][0]["message"].get("content") or ""
+
+
 def _docvortex_markdown(path, **options):
     result = _docvortex.parse(path, **options)
     md = _docvortex.render_artifact(
@@ -840,8 +1001,10 @@ def _has_text(md):
     return len(re.sub(r"\W", "", text)) >= 20
 
 
-def extract_text(path):
+def extract_text(path, config=None):
     """Devuelve (texto, es_markdown). Los documentos pasan por docvortex."""
+    if path.suffix.lower() in IMAGE_EXTS:
+        return ocr_image(path, config)
     if path.suffix.lower() not in DOCUMENT_EXTS or not docvortex_available():
         return path.read_text(encoding="utf-8", errors="replace"), path.suffix == ".md"
     md = _docvortex_markdown(path)
@@ -888,13 +1051,26 @@ def cmd_add_dir(args, config):
 
     dirs = config.data["directories"]
     path_str = str(path)
-    if path_str in dirs:
+    images = getattr(args, "images", False)
+    image_dirs = config.data.setdefault("image_dirs", [])
+    if path_str in dirs and (not images or path_str in image_dirs):
         print(f"Directory already indexed: {path}")
         return
 
-    dirs.append(path_str)
+    if path_str not in dirs:
+        dirs.append(path_str)
+        print(f"Added: {path}")
+    if images and path_str not in image_dirs:
+        image_dirs.append(path_str)
+        print(f"Images (OCR, engine '{config.ocr_engine}') enabled for: {path}")
+        if not config.images_enabled():
+            print(
+                "  Warning: no OCR engine available. Install ownsearch[docs] for "
+                "the local engine, or set ocr_engine vlm with ocr_base_url and "
+                "ocr_model.",
+                file=sys.stderr,
+            )
     config.save()
-    print(f"Added: {path}")
     print("Run 'ownsearch index' to index it.")
 
 
@@ -918,6 +1094,8 @@ def cmd_remove_dir(args, config):
             sys.exit(1)
 
     dirs.remove(path_str)
+    if path_str in config.data.get("image_dirs", []):
+        config.data["image_dirs"].remove(path_str)
     config.save()
 
     # Remove from DB
@@ -941,7 +1119,8 @@ def cmd_list_dirs(config):
         return
     for d in config.directories:
         exists = "✓" if Path(d).exists() else "✗"
-        print(f"  {exists} {d}")
+        images = " [images]" if str(d) in config.image_dirs else ""
+        print(f"  {exists} {d}{images}")
 
 
 def cmd_config_show(config):
@@ -960,6 +1139,10 @@ def cmd_config_set(args, config):
         "embed_model",
         "embed_workers",
         "chunk_overlap",
+        "ocr_engine",
+        "ocr_base_url",
+        "ocr_model",
+        "ocr_api_key_cmd",
     }
     if key not in valid_keys:
         print(
@@ -967,6 +1150,9 @@ def cmd_config_set(args, config):
         )
         sys.exit(1)
 
+    if key == "ocr_engine" and value not in ("local", "vlm"):
+        print("ocr_engine must be 'local' or 'vlm'", file=sys.stderr)
+        sys.exit(1)
     if key in ("embed_workers", "chunk_overlap"):
         minimum = 1 if key == "embed_workers" else 0
         try:
@@ -1031,6 +1217,13 @@ def cmd_index(args, config):
     # Check embeddings availability (auto-pull if needed)
     has_embeddings = ensure_embeddings_ready(config)
 
+    images_ok = bool(config.image_dirs) and config.images_enabled()
+    if config.image_dirs and not images_ok:
+        print(
+            f"  Warning: OCR engine '{config.ocr_engine}' not available; images are skipped.",
+            file=sys.stderr,
+        )
+
     # Gather all current files across all directories
     current_files = {}  # absolute_path -> (dir_str, mtime_ns, size)
     for dir_path in config.directories:
@@ -1041,9 +1234,14 @@ def cmd_index(args, config):
             )
             continue
         dir_str = str(dp)
+        extensions = config.extensions
+        if dir_str in config.image_dirs and images_ok:
+            extensions = extensions | IMAGE_EXTS
         for abs_path, _, mtime_ns, size in walk_directory(
-            dp, config.extensions, config.skip_dirs
+            dp, extensions, config.skip_dirs
         ):
+            if Path(abs_path).suffix.lower() in IMAGE_EXTS and size < IMAGE_MIN_BYTES:
+                continue
             current_files[abs_path] = (dir_str, mtime_ns, size)
 
     # Get stored file states
@@ -1099,7 +1297,7 @@ def cmd_index(args, config):
             full_path = Path(path)
             dir_str, mtime_ns, size = current_files[path]
             try:
-                text, is_markdown = extract_text(full_path)
+                text, is_markdown = extract_text(full_path, config)
             except (OSError, PermissionError) as e:
                 print(f"  Skip {path}: {e}", file=sys.stderr)
                 continue
@@ -1745,6 +1943,11 @@ def main():
     # add-dir
     add = sub.add_parser("add-dir", help="Add a directory to index")
     add.add_argument("path", help="Directory path to add")
+    add.add_argument(
+        "--images",
+        action="store_true",
+        help="Also index images in it with OCR (engine: ocr_engine)",
+    )
 
     # remove-dir
     rm = sub.add_parser("remove-dir", help="Remove a directory from index")
