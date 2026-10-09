@@ -15,7 +15,7 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # Defaults
 DEFAULT_CONFIG_DIR = Path.home() / ".config" / "ownsearch"
