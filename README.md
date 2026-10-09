@@ -44,6 +44,12 @@ ownsearch index --full
 # Full-text search (fast, literal)
 ownsearch search "kubernetes cilium"
 
+# Full-text search that requires every word (no OR fallback)
+ownsearch search --strict "kubernetes cilium"
+
+# Parallel embedding requests while indexing (default: 4)
+ownsearch index --workers 8
+
 # Semantic search (finds related content even with different wording)
 ownsearch search --semantic "network security"
 
@@ -53,6 +59,9 @@ ownsearch search --both "migration strategy"
 # Filter results by directory
 ownsearch search --dir ~/workspace/project "deploy"
 
+# Up to N characters of each matching chunk instead of a short snippet
+ownsearch search --json --max-chars 1500 "query"
+
 # JSON output (for integration with other tools/agents)
 ownsearch search --json "query"
 
@@ -61,12 +70,13 @@ ownsearch search --limit 5 "query"
 
 # Show status
 ownsearch status
+ownsearch status --json   # same, machine-readable (includes last index time)
 ```
 
 ## Directory management
 
 ```bash
-ownsearch add-dir PATH      # Add a directory to the index
+ownsearch add-dir PATH      # Add a directory to the index (--images: also OCR its images)
 ownsearch remove-dir PATH   # Remove a directory and its data from the index
 ownsearch list-dirs         # List indexed directories
 ```
@@ -77,6 +87,10 @@ ownsearch list-dirs         # List indexed directories
 - **Incremental indexing**: By default, only processes files whose mtime/size changed since the last run. Deleted files are cleaned up automatically.
 - **Graceful degradation**: If ollama is unavailable, FTS5 search still works (semantic search is skipped).
 - **Smart chunking**: Splits by markdown headings. Large files are partitioned into ~4000 char chunks while preserving heading context.
+- **Full-text fallback**: Full-text search first requires every word. If that finds nothing, it retries with any word, and BM25 usually ranks first the chunks with more of the words. Use `--strict` to turn this off. Matches in headings count double.
+- **Old embeddings**: Up to 0.2.0, embeddings used only the first 2000 characters of each chunk. `index` and `status` warn about it. Run `ownsearch index --full` once to rebuild them.
+- **Context across chunks** (optional): `ownsearch config set chunk_overlap 200` adds the last 200 characters of the previous chunk to the text that gets embedded. A section split in two keeps its context in both vectors. The stored text and the full-text index do not change. Run `ownsearch index --full` after changing it.
+- **Parallel indexing**: Embedding requests run in parallel (`--workers`, or `ownsearch config set embed_workers N`).
 - **Retry with backoff**: Embedding requests retry on failure with exponential backoff to handle transient server issues.
 
 ## Supported file types
@@ -98,9 +112,44 @@ pipx inject ownsearch docvortex
 With it, ownsearch converts these files to Markdown with [DocVortex](https://github.com/myhloli/DocVortex) and indexes them by heading: `.pdf`, `.doc`, `.docx`, `.rtf`, `.ppt`, `.pptx`, `.xls`, `.xlsx`, `.odt`, `.ods`, `.odp`, `.html`, `.htm`, `.epub`, `.csv`, `.tsv`.
 
 - No extra config: the formats are picked up on the next `ownsearch index`.
-- There is no OCR. Scanned PDFs give no text.
+- Scanned PDFs go through OCR (docvortex detects them). If a PDF still gives no text, ownsearch retries it forcing OCR.
 - The extra is heavy (~500 MB, it pulls OpenCV and NumPy). Conversion is slower than reading text, but only changed files are converted again.
-- A file that fails to convert is skipped until it changes.
+- A file that fails to convert (also when forced OCR fails on it) is skipped until it changes. Run `ownsearch index --full` to try all files again.
+
+### Images (OCR)
+
+Images (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.bmp`, `.tif`, `.tiff`) are indexed only in the directories you turn on, because most images in a wiki are screenshots and icons:
+
+```bash
+ownsearch add-dir ~/Documents/scans --images   # also works on a directory already added
+ownsearch list-dirs                            # shows [images] next to it
+```
+
+Images under 8 KB are skipped. Two OCR engines:
+
+- `local` (default): the OCR models of docvortex, on the CPU. Needs the `docs` extra. The first use downloads the models (~230 MB); after that it works without network. About 1-4 s per image.
+- `vlm`: a vision model behind an OpenAI-compatible `/v1/chat/completions` endpoint (for example Qwen-VL on vLLM or LiteLLM). Cleaner text and tables kept as Markdown. A vision model can also invent text, so check it on your own images first. With Pillow (it comes with the `docs` extra) images are reduced to 1600 px before sending; without it, only `.png`, `.jpg`, `.webp` and `.gif` under 5 MB are sent.
+
+```bash
+ownsearch config set ocr_engine vlm
+ownsearch config set ocr_base_url https://your-gateway/v1
+ownsearch config set ocr_model qwen3.8-27b
+ownsearch config set ocr_api_key_cmd 'pass show my/gateway-key'   # or OWNSEARCH_OCR_API_KEY
+```
+
+If the endpoint does not answer or the engine is not available, the image is skipped and retried on the next `ownsearch index`. An image that fails by itself (a corrupt file) is skipped until it changes. So is an image the endpoint rejects with HTTP 400, 413, 415 or 422. If every image fails with HTTP 400, check that the model accepts images, fix it and run `ownsearch index --full`. If the engine is turned off, images leave the index until it is back. Changing the engine does not redo the images already indexed: run `ownsearch index --full` for that.
+
+### Fast semantic search (numpy)
+
+Install the `fast` extra for large indexes:
+
+```bash
+pipx install 'ownsearch[fast]'
+# or, if ownsearch is already installed with pipx:
+pipx inject ownsearch numpy
+```
+
+With numpy, semantic search keeps the vectors in a cache next to the database (`<db_path>.vectors.npy`) and compares them all in one matrix product. Without numpy, ownsearch compares them one by one in Python, which is slow beyond some tens of thousands of chunks.
 
 ## Requirements
 
@@ -149,9 +198,15 @@ Prefer hybrid search with JSON output so you can parse hits programmatically:
 - `--both`     combine lexical + semantic, deduplicated (best default)
 - `--semantic` semantic only (related content with different wording)
 - (no flag)    fast literal FTS5 only
-- `--dir PATH` scope to one indexed directory
+- `--dir PATH` scope to one indexed directory (applied before `--limit`)
+- `--max-chars N` return up to N characters of each chunk, enough to quote it
 - `--limit N`  cap results
-- `--json`     machine-readable hits (file path + chunk); always use from a tool flow
+- `--json`     machine-readable hits; always use from a tool flow. Each hit has
+  `path`, `heading`, `snippet`, `score`, `method`, `chunk_id` and `mtime` (file
+  date, ISO 8601). With `--both`, `methods` says which searches found it; hits
+  found by both are usually the most relevant.
+- Exit code 3: semantic search was requested but the embedding backend is down.
+  The hits (if any) are full-text only.
 
 Each JSON hit gives the source file path and the matching chunk. Open the file to
 get full context before answering — this is retrieval only; reason over the results

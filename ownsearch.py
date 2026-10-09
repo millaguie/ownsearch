@@ -2,6 +2,8 @@
 """ownsearch — Smart full-text and semantic search across your local documents."""
 
 import argparse
+import base64
+import io
 import json
 import math
 import os
@@ -13,9 +15,31 @@ import sys
 import time
 import urllib.request
 import urllib.error
+from datetime import datetime, timezone
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-__version__ = "0.2.0"
+# Extra opcional `ownsearch[fast]`: busqueda semantica vectorizada. Se
+# importa al primer uso: cuesta unos 80 ms, y una busqueda de texto (lo que
+# mas lanzan los agentes, un proceso por consulta) no lo necesita.
+_NP_UNSET = object()
+np = _NP_UNSET
+
+
+def _numpy():
+    """El modulo numpy, o None si no esta instalado."""
+    global np
+    if np is _NP_UNSET:
+        try:
+            import numpy
+        except ImportError:
+            numpy = None
+        np = numpy
+    return np
+
+
+__version__ = "0.3.0"
 
 # Defaults
 DEFAULT_CONFIG_DIR = Path.home() / ".config" / "ownsearch"
@@ -24,7 +48,19 @@ DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_EMBED_MODEL = "bge-m3"
 EMBED_DIM = 1024
 MAX_CHUNK_CHARS = 4000
+MAX_OVERLAP = MAX_CHUNK_CHARS // 2
+# bge-m3 admite 8192 tokens. En texto latino 8000 caracteres caben y el
+# fragmento entero (titulo incluido) llega al modelo; en escrituras densas
+# (chino, japones...) el servidor puede recortar el final.
+EMBED_MAX_CHARS = 8000
 BATCH_SIZE = 5
+DEFAULT_EMBED_WORKERS = 4
+# Codigo de salida de `search` cuando se pidio busqueda semantica y no se
+# pudo hacer.
+EXIT_SEMANTIC_UNAVAILABLE = 3
+SEARCH_EMBED_RETRIES = 1
+# Peso de cada columna de chunks_fts en BM25: content, heading.
+BM25_WEIGHTS = (1.0, 2.0)
 
 INDEXABLE_EXTS = {".md", ".txt", ".org", ".rst"}
 # Formatos que se convierten a Markdown con docvortex (extra opcional
@@ -47,6 +83,26 @@ DOCUMENT_EXTS = {
     ".csv",
     ".tsv",
 }
+# Imagenes: solo en las carpetas activadas con `add-dir --images`, porque en
+# una wiki la mayoria son capturas e iconos.
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+# Por debajo de esto suelen ser iconos o adornos sin texto util.
+IMAGE_MIN_BYTES = 8 * 1024
+IMAGE_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+}
+OCR_PROMPT = (
+    "Transcribe todo el texto de esta imagen, tal cual, en Markdown. "
+    "Respeta tablas y titulos. No resumas ni comentes. "
+    "Si no hay texto, responde exactamente: (sin texto)"
+)
 SKIP_DIRS = {
     ".git",
     ".obsidian",
@@ -85,6 +141,15 @@ class Config:
             "embed_base_url": "",
             "embed_api_key": "",
             "embed_api_key_cmd": "",
+            "embed_workers": DEFAULT_EMBED_WORKERS,
+            "chunk_overlap": 0,
+            # Carpetas con OCR de imagenes y motor: "local" (docvortex, sin
+            # red) o "vlm" (modelo con vision por API compatible con OpenAI).
+            "image_dirs": [],
+            "ocr_engine": "local",
+            "ocr_base_url": "",
+            "ocr_model": "",
+            "ocr_api_key_cmd": "",
             "directories": [],
             "extensions": list(INDEXABLE_EXTS),
             "skip_dirs": list(SKIP_DIRS),
@@ -117,9 +182,17 @@ class Config:
 
     @property
     def embed_api_key(self):
-        """Clave del backend OpenAI.
+        """Clave del backend OpenAI, calculada una sola vez.
 
-        Por orden: variable de entorno, comando (para sacarla de `pass` sin
+        Cada peticion de embeddings la pide, y con varios hilos ejecutar
+        embed_api_key_cmd en cada una lanzaria decenas de `pass` a la vez.
+        """
+        if not hasattr(self, "_embed_api_key"):
+            self._embed_api_key = self._read_embed_api_key()
+        return self._embed_api_key
+
+    def _read_embed_api_key(self):
+        """Por orden: variable de entorno, comando (para sacarla de `pass` sin
         guardarla en el config) y, como ultimo recurso, el valor literal.
         """
         env = os.environ.get("OWNSEARCH_EMBED_API_KEY")
@@ -140,6 +213,57 @@ class Config:
             except Exception as e:
                 print(f"  Warning: embed_api_key_cmd fallo: {e}", file=sys.stderr)
         return (self.data.get("embed_api_key") or "").strip()
+
+    @property
+    def embed_workers(self):
+        try:
+            return max(1, int(self.data.get("embed_workers", DEFAULT_EMBED_WORKERS)))
+        except (TypeError, ValueError):
+            return DEFAULT_EMBED_WORKERS
+
+    @property
+    def image_dirs(self):
+        return set(self.data.get("image_dirs") or [])
+
+    @property
+    def ocr_engine(self):
+        return self.data.get("ocr_engine") or "local"
+
+    @property
+    def ocr_api_key(self):
+        """Clave del modelo de OCR: variable de entorno o comando, una vez."""
+        if not hasattr(self, "_ocr_api_key"):
+            key = os.environ.get("OWNSEARCH_OCR_API_KEY", "").strip()
+            cmd = self.data.get("ocr_api_key_cmd")
+            if not key and cmd:
+                try:
+                    out = subprocess.run(
+                        cmd, shell=True, capture_output=True, text=True, timeout=15
+                    )
+                    if out.returncode == 0 and out.stdout.strip():
+                        key = out.stdout.strip().splitlines()[0]
+                    else:
+                        print(
+                            f"  Warning: ocr_api_key_cmd fallo: {out.stderr.strip()[:120]}",
+                            file=sys.stderr,
+                        )
+                except Exception as e:  # noqa: BLE001
+                    print(f"  Warning: ocr_api_key_cmd fallo: {e}", file=sys.stderr)
+            self._ocr_api_key = key
+        return self._ocr_api_key
+
+    def images_enabled(self):
+        """True si hay motor de OCR para las carpetas con imagenes."""
+        if self.ocr_engine == "vlm":
+            return bool(self.data.get("ocr_base_url") and self.data.get("ocr_model"))
+        return docvortex_available() and _numpy() is not None
+
+    @property
+    def chunk_overlap(self):
+        try:
+            return min(MAX_OVERLAP, max(0, int(self.data.get("chunk_overlap", 0))))
+        except (TypeError, ValueError):
+            return 0
 
     @property
     def directories(self):
@@ -266,7 +390,7 @@ class _PermanentFail(list):
 PERMANENT_FAIL = _PermanentFail()
 
 
-def get_embeddings_batch(config, texts):
+def get_embeddings_batch(config, texts, retries=5):
     """Get embeddings for a batch of texts from ollama. Truncates and retries on failure.
 
     Returns a list aligned with ``texts``; each item is the embedding vector, or
@@ -274,22 +398,25 @@ def get_embeddings_batch(config, texts):
     when the model can't embed that specific text.
     """
     # Truncate texts to avoid OOM on the server
-    truncated = [t[:2000] for t in texts]
+    truncated = [t[:EMBED_MAX_CHARS] for t in texts]
 
     # Try batch first
-    embeddings = _embed_request(config, truncated)
+    embeddings = _embed_request(config, truncated, retries)
     if (
         embeddings is not PERMANENT_FAIL
         and embeddings
         and len(embeddings) == len(texts)
     ):
         return embeddings
+    if len(texts) == 1:
+        # Con un solo texto, probarlo "uno a uno" repetiria la misma peticion.
+        return [PERMANENT_FAIL if embeddings is PERMANENT_FAIL else None]
 
     # Batch failed — fall back to one-by-one. A single poisoned text (NaN) makes
     # ollama 500 the whole batch, so isolating per-text salvages the rest.
     results = []
     for text in truncated:
-        vec = _embed_request(config, text)
+        vec = _embed_request(config, text, retries)
         if vec is PERMANENT_FAIL:
             results.append(PERMANENT_FAIL)
         elif vec:
@@ -509,6 +636,232 @@ def unpack_vector(blob):
     return struct.unpack(f"{n}f", blob)
 
 
+def embeds_truncated_at(conn):
+    """Recorte con el que se hicieron los embeddings, si es menor que el actual.
+
+    Hasta 0.2.0 el recorte era de 2000 caracteres y no se guardaba. Devuelve
+    None si no hay embeddings o si ya se hicieron con EMBED_MAX_CHARS.
+    """
+    try:
+        if not conn.execute("SELECT 1 FROM embeddings LIMIT 1").fetchone():
+            return None
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'embed_max_chars'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    try:
+        stored = int(row[0]) if row else 2000
+    except ValueError:
+        stored = 2000
+    return stored if stored < EMBED_MAX_CHARS else None
+
+
+def _set_last_index(conn):
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_index', ?)",
+        (_iso_now(),),
+    )
+
+
+def _iso_now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def warn_truncated_embeds(conn):
+    old = embeds_truncated_at(conn)
+    if old is not None:
+        print(
+            f"  Warning: embeddings were made with text cut at {old} characters "
+            f"(now {EMBED_MAX_CHARS}). Run 'ownsearch index --full' to rebuild them.",
+            file=sys.stderr,
+        )
+
+
+def bump_vectors_rev(conn):
+    """Marca la cache de vectores como caducada.
+
+    Llamalo siempre que cambie la tabla embeddings, aunque sea por borrado
+    en cascada de chunks.
+    """
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('vectors_rev', ?)",
+        (str(time.time_ns()),),
+    )
+
+
+def _vectors_rev(conn):
+    """Version de la tabla embeddings para validar la cache.
+
+    Ademas de vectors_rev lleva el numero de filas y el chunk_id maximo:
+    una version anterior de ownsearch (sin vectors_rev) que indexe sobre la
+    misma base de datos tambien invalida la cache.
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'vectors_rev'"
+        ).fetchone()
+        count, max_id = conn.execute(
+            "SELECT COUNT(*), MAX(chunk_id) FROM embeddings"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    rev = row[0] if row and row[0] is not None else "0"
+    return f"{rev}:{count}:{max_id}"
+
+
+def _cache_matches_db(conn, mat, ids, samples=8):
+    """Compara unas filas de la cache con la base de datos.
+
+    vectors_rev y la huella COUNT/MAX no ven todo: una version anterior que
+    reindexa entero reutiliza los mismos chunk_id, y dos procesos que
+    reconstruyen a la vez pueden mezclar ficheros. Unas pocas lecturas por
+    chunk_id lo detectan sin leer toda la tabla.
+    """
+    n = ids.shape[0]
+    if n == 0:
+        return True
+    picks = {0, n - 1} | {(n * k) // samples for k in range(1, samples)}
+    for i in picks:
+        row = conn.execute(
+            "SELECT vector FROM embeddings WHERE chunk_id = ?", (int(ids[i]),)
+        ).fetchone()
+        if row is None or len(row[0]) != mat.shape[1] * 4:
+            return False
+        vec = np.frombuffer(row[0], dtype=np.float32)
+        norm = np.linalg.norm(vec)
+        if norm and not np.allclose(vec / norm, mat[i], atol=1e-5):
+            return False
+    return True
+
+
+def _load_cached_matrix(mat_path, ids_path):
+    """Lee la cache; None si falta, esta corrupta o no cuadra."""
+    try:
+        mat = np.load(mat_path, mmap_mode="r")
+        ids = np.load(ids_path, mmap_mode="r")
+    except Exception:  # noqa: BLE001 - fichero truncado: EOFError, ValueError...
+        return None
+    if mat.ndim != 2 or ids.ndim != 1 or ids.dtype != np.int64:
+        return None
+    if mat.dtype != np.float32 or mat.shape[0] != ids.shape[0]:
+        return None
+    return mat, ids
+
+
+def load_vector_matrix(db_path, conn, dim):
+    """Matriz (n, dim) de vectores normalizados y sus chunk_ids, con numpy.
+
+    Solo entran los vectores de la dimension `dim`, la de la consulta: los
+    restos de otro modelo (mismo nombre, otro backend) no se comparan.
+
+    Se guarda junto a la base de datos en dos .npy y se abre con mmap: leer
+    y desempaquetar cien mil BLOBs en cada consulta cuesta mas que la propia
+    busqueda. La cache se rehace cuando cambia vectors_rev.
+    """
+    rev = _vectors_rev(conn)
+    base = str(db_path)
+    mat_path, ids_path, rev_path = (
+        base + ".vectors.npy",
+        base + ".ids.npy",
+        base + ".vectors.rev",
+    )
+    try:
+        cached_rev = Path(rev_path).read_text()
+    except OSError:
+        cached_rev = None
+    if rev is not None and cached_rev == rev:
+        cached = _load_cached_matrix(mat_path, ids_path)
+        if (
+            cached is not None
+            and cached[0].shape[1] == dim
+            and _cache_matches_db(conn, *cached)
+        ):
+            return cached
+
+    rows = conn.execute("SELECT chunk_id, vector FROM embeddings").fetchall()
+    if not rows:
+        return np.zeros((0, 0), dtype=np.float32), np.zeros(0, dtype=np.int64)
+    size = dim * 4
+    rows = [r for r in rows if len(r[1]) == size]
+    if not rows:
+        return np.zeros((0, dim), dtype=np.float32), np.zeros(0, dtype=np.int64)
+    ids = np.fromiter((r[0] for r in rows), dtype=np.int64, count=len(rows))
+    mat = np.frombuffer(b"".join(r[1] for r in rows), dtype=np.float32)
+    mat = mat.reshape(len(rows), size // 4).copy()
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    mat /= norms
+
+    if rev is not None:
+        # Nombre temporal por proceso: dos busquedas a la vez pueden
+        # reconstruir la cache al mismo tiempo.
+        tmps = []
+        try:
+            for path, arr in ((mat_path, mat), (ids_path, ids)):
+                tmp = f"{path}.{os.getpid()}.tmp"
+                tmps.append(tmp)
+                with open(tmp, "wb") as f:
+                    np.save(f, arr)
+                os.replace(tmp, path)
+            Path(rev_path).write_text(rev)
+        except OSError as e:
+            print(
+                f"  Warning: no se pudo guardar la cache de vectores: {e}",
+                file=sys.stderr,
+            )
+            for tmp in tmps:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+    return mat, ids
+
+
+def top_chunks_numpy(db_path, conn, query_vec, limit, allowed=None):
+    """[(sim, chunk_id)] de los `limit` vectores mas parecidos.
+
+    `allowed`: conjunto de chunk_ids entre los que buscar (filtro --dir).
+    """
+    if limit < 1 or _numpy() is None:
+        return []
+    q = np.asarray(query_vec, dtype=np.float32)
+    mat, ids = load_vector_matrix(db_path, conn, q.shape[0])
+    if mat.shape[0] == 0 or mat.shape[1] != q.shape[0]:
+        return []
+    norm = np.linalg.norm(q)
+    if norm == 0:
+        return []
+    sims = mat @ (q / norm)
+    candidates = len(sims)
+    if allowed is not None:
+        mask = np.isin(ids, np.fromiter(allowed, dtype=np.int64, count=len(allowed)))
+        sims = np.where(mask, sims, -np.inf)
+        candidates = int(mask.sum())
+    k = min(limit, candidates)
+    if k < 1:
+        return []
+    top = np.argpartition(-sims, k - 1)[:k]
+    top = top[np.argsort(-sims[top])]
+    return [(float(sims[i]), int(ids[i])) for i in top]
+
+
+def top_chunks_python(conn, query_vec, limit, allowed=None):
+    """Lo mismo que top_chunks_numpy, sin dependencias. Lento con mucho indice."""
+    if limit < 1:
+        return []
+    scored = []
+    size = len(query_vec) * 4
+    for chunk_id, vec_blob in conn.execute("SELECT chunk_id, vector FROM embeddings"):
+        # Igual que la ruta numpy: los restos de otro modelo no se comparan.
+        if allowed is not None and chunk_id not in allowed:
+            continue
+        if len(vec_blob) == size:
+            scored.append((cosine_sim(query_vec, unpack_vector(vec_blob)), chunk_id))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[:limit]
+
+
 def cosine_sim(a, b):
     dot = sum(x * y for x, y in zip(a, b))
     na = math.sqrt(sum(x * x for x in a))
@@ -538,16 +891,213 @@ def docvortex_available():
     return bool(_docvortex)
 
 
-def extract_text(path):
-    """Devuelve (texto, es_markdown). Los documentos pasan por docvortex."""
-    if path.suffix.lower() not in DOCUMENT_EXTS or not docvortex_available():
-        return path.read_text(encoding="utf-8", errors="replace"), path.suffix == ".md"
-    result = _docvortex.parse(path)
+class OcrConfigError(OSError):
+    """El endpoint de OCR rechaza la configuracion (clave, modelo, URL)."""
+
+
+class OcrUnavailable(OSError):
+    """El motor de OCR no esta disponible (dependencia, version, Pillow).
+
+    Es un OSError para que index no registre la imagen y la reintente
+    cuando se arregle el motor. Un fallo de una imagen concreta (fichero
+    corrupto) sigue siendo un error normal y se registra sin chunks.
+    """
+
+
+def ocr_image(path, config):
+    """Texto de una imagen con el motor de OCR configurado.
+
+    Un fallo de red (OSError) no registra el fichero: se reintenta en el
+    siguiente index.
+    """
+    if config is not None and config.ocr_engine == "vlm":
+        text = _ocr_vlm(path, config)
+        if text.strip() == "(sin texto)":
+            text = ""
+        return text, True
+    return _ocr_local(path), False
+
+
+def _ocr_local(path):
+    """OCR con los modelos de docvortex, directamente sobre la imagen.
+
+    docvortex no acepta imagenes como documento, asi que se usan sus piezas
+    de OCR de PDF (deteccion de bloques y reconocimiento de lineas). Son
+    funciones internas: si cambian en otra version, falla aqui con un error
+    claro en vez de indexar mal.
+    """
+    if not docvortex_available():
+        raise OcrUnavailable("local OCR needs ownsearch[docs]")
+    try:
+        from docvortex.analyzers.ocr.pdf import _analyze_page
+        from docvortex.analyzers.ocr.runtime import get_runtime
+        from PIL import Image, ImageOps
+    except ImportError as e:
+        raise OcrUnavailable(f"this docvortex version has no usable OCR: {e}") from e
+    np_ = _numpy()
+    if np_ is None:
+        raise OcrUnavailable("local OCR needs numpy")
+    rgb = np_.asarray(_open_rgb(path, Image, ImageOps))
+    try:
+        layout, text_model = get_runtime()
+    except Exception as e:  # noqa: BLE001
+        # Cargar (o descargar) los modelos es cosa del motor, no de la
+        # imagen: se reintenta. Un fallo al analizar la imagen, abajo, no.
+        raise OcrUnavailable(f"local OCR models not available: {e}") from e
+    try:
+        result = _analyze_page(rgb, layout.predict(rgb), text_model, 0)
+    except (TypeError, AttributeError) as e:
+        # Firma distinta: docvortex cambio sus funciones internas. Es del
+        # motor, no de la imagen; registrarla la perderia.
+        raise OcrUnavailable(f"docvortex OCR API changed: {e}") from e
+    if not (isinstance(result, tuple) and len(result) == 2):
+        raise OcrUnavailable("docvortex OCR API changed: unexpected result")
+    blocks = result[0]
+    parts = []
+    for block in blocks:
+        content = block.get("content")
+        if isinstance(content, list):
+            content = "".join(
+                c.get("content", "") if isinstance(c, dict) else str(c) for c in content
+            )
+        if content:
+            parts.append(str(content))
+    return "\n\n".join(parts)
+
+
+# Formatos que un modelo con vision acepta tal cual, sin Pillow.
+VLM_RAW_MIME = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+VLM_RAW_MAX_BYTES = 5 * 1024 * 1024
+# Respuestas del endpoint de OCR que dependen de la imagen, no del servicio.
+VLM_IMAGE_ERRORS = {400, 413, 415, 422}
+
+
+def _open_rgb(path, Image, ImageOps):
+    """Abre la imagen como RGB.
+
+    Pillow avisa de una imagen corrupta con OSError (UnidentifiedImageError,
+    "image file is truncated"), que index tomaria por un fallo transitorio y
+    reintentaria siempre. Se lee el fichero aparte (un fallo de disco sigue
+    siendo OSError) y los fallos al decodificar pasan a ValueError: la
+    imagen se registra sin chunks hasta que cambie.
+    """
+    data = path.read_bytes()
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            return ImageOps.exif_transpose(im).convert("RGB")
+    except (OSError, SyntaxError) as e:
+        raise ValueError(f"cannot decode image: {e}") from e
+
+
+def _image_data_url(path):
+    """Imagen como data URL. Con Pillow se reduce a 1600 px: una foto de
+    movil ocupa varios MB y el modelo no necesita tanto. Sin Pillow solo se
+    envian tal cual los formatos web de menos de 5 MB."""
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:
+        suffix = path.suffix.lower()
+        if suffix not in VLM_RAW_MIME or path.stat().st_size > VLM_RAW_MAX_BYTES:
+            raise OcrUnavailable(
+                f"{suffix} images over 5 MB or not web formats need Pillow"
+            ) from None
+        data, mime = path.read_bytes(), IMAGE_MIME[suffix]
+    else:
+        im = _open_rgb(path, Image, ImageOps)
+        im.thumbnail((1600, 1600))
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=85)
+        data, mime = buf.getvalue(), "image/jpeg"
+    return f"data:{mime};base64," + base64.b64encode(data).decode()
+
+
+def _ocr_vlm(path, config):
+    """OCR con un modelo con vision por /v1/chat/completions."""
+    base = config.data.get("ocr_base_url", "").rstrip("/")
+    body = {
+        "model": config.data.get("ocr_model"),
+        "temperature": 0,
+        "max_tokens": 4000,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": OCR_PROMPT},
+                    {"type": "image_url", "image_url": {"url": _image_data_url(path)}},
+                ],
+            }
+        ],
+    }
+    headers = {"Content-Type": "application/json"}
+    key = config.ocr_api_key
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    req = urllib.request.Request(
+        f"{base}/chat/completions", data=json.dumps(body).encode(), headers=headers
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            body = resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code in VLM_IMAGE_ERRORS:
+            # El endpoint rechaza esta imagen en concreto (no la puede leer,
+            # es demasiado grande...). Reintentarla en cada index no la
+            # arregla: ValueError la registra sin chunks hasta que cambie.
+            raise ValueError(f"OCR endpoint rejected the image: HTTP {e.code}") from e
+        if e.code in (401, 403, 404):
+            raise OcrConfigError(
+                f"OCR endpoint refused the request (HTTP {e.code}): check "
+                "ocr_base_url, ocr_model and the API key"
+            ) from e
+        raise
+    except OSError:
+        raise
+    except Exception as e:  # noqa: BLE001 - IncompleteRead, BadStatusLine...
+        # Conexion cortada a mitad de respuesta: no es OSError, pero es un
+        # fallo del servicio y se reintenta.
+        raise OcrUnavailable(f"OCR response failed: {e}") from e
+    try:
+        content = json.loads(body)["choices"][0]["message"].get("content")
+        if content is None:
+            return ""
+        if not isinstance(content, str):
+            raise TypeError(f"content is {type(content).__name__}")
+        return content
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError) as e:
+        # Un 200 sin la forma esperada (pagina de error de un proxy, JSON
+        # cortado, {"error": ...}) es un problema del servicio, no de la
+        # imagen: se reintenta.
+        raise OcrUnavailable(f"unexpected OCR response: {e}") from e
+
+
+def _docvortex_markdown(path, **options):
+    result = _docvortex.parse(path, **options)
     md = _docvortex.render_artifact(
         result.middle_json, "markdown", assets=result.assets
     ).content
     if isinstance(md, bytes):
         md = md.decode("utf-8", errors="replace")
+    return md
+
+
+def _has_text(md):
+    """True si el Markdown tiene texto real, no solo enlaces a imagenes."""
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", md)
+    return len(re.sub(r"\W", "", text)) >= 20
+
+
+def extract_text(path, config=None):
+    """Devuelve (texto, es_markdown). Los documentos pasan por docvortex."""
+    if path.suffix.lower() in IMAGE_EXTS:
+        return ocr_image(path, config)
+    if path.suffix.lower() not in DOCUMENT_EXTS or not docvortex_available():
+        return path.read_text(encoding="utf-8", errors="replace"), path.suffix == ".md"
+    md = _docvortex_markdown(path)
+    if path.suffix.lower() == ".pdf" and not _has_text(md):
+        # docvortex decide por PDF si hace falta OCR, y a veces se equivoca:
+        # PDFs con fuentes incrustadas raras dan solo imagenes. Se reintenta
+        # forzando OCR (solo los PDF admiten parse_mode).
+        md = _docvortex_markdown(path, parse_mode="ocr")
     # docvortex pone los titulos en negrita (`## **Titulo**`); sin esto el
     # asterisco acaba en el heading de cada chunk.
     md = re.sub(r"^(#{1,6}\s+)\*\*(.+?)\*\*\s*$", r"\1\2", md, flags=re.MULTILINE)
@@ -586,13 +1136,26 @@ def cmd_add_dir(args, config):
 
     dirs = config.data["directories"]
     path_str = str(path)
-    if path_str in dirs:
+    images = getattr(args, "images", False)
+    image_dirs = config.data.setdefault("image_dirs", [])
+    if path_str in dirs and (not images or path_str in image_dirs):
         print(f"Directory already indexed: {path}")
         return
 
-    dirs.append(path_str)
+    if path_str not in dirs:
+        dirs.append(path_str)
+        print(f"Added: {path}")
+    if images and path_str not in image_dirs:
+        image_dirs.append(path_str)
+        print(f"Images (OCR, engine '{config.ocr_engine}') enabled for: {path}")
+        if not config.images_enabled():
+            print(
+                "  Warning: no OCR engine available. Install ownsearch[docs] for "
+                "the local engine, or set ocr_engine vlm with ocr_base_url and "
+                "ocr_model.",
+                file=sys.stderr,
+            )
     config.save()
-    print(f"Added: {path}")
     print("Run 'ownsearch index' to index it.")
 
 
@@ -616,6 +1179,8 @@ def cmd_remove_dir(args, config):
             sys.exit(1)
 
     dirs.remove(path_str)
+    if path_str in config.data.get("image_dirs", []):
+        config.data["image_dirs"].remove(path_str)
     config.save()
 
     # Remove from DB
@@ -626,6 +1191,7 @@ def cmd_remove_dir(args, config):
         (path_str,),
     )
     conn.execute("DELETE FROM files WHERE directory = ?", (path_str,))
+    bump_vectors_rev(conn)
     conn.commit()
     conn.close()
     print(f"Removed: {path_str}")
@@ -638,7 +1204,8 @@ def cmd_list_dirs(config):
         return
     for d in config.directories:
         exists = "✓" if Path(d).exists() else "✗"
-        print(f"  {exists} {d}")
+        images = " [images]" if str(d) in config.image_dirs else ""
+        print(f"  {exists} {d}{images}")
 
 
 def cmd_config_show(config):
@@ -651,12 +1218,53 @@ def cmd_config_set(args, config):
     key = args.key
     value = args.value
 
-    valid_keys = {"db_path", "ollama_url", "embed_model"}
+    valid_keys = {
+        "db_path",
+        "ollama_url",
+        "embed_model",
+        "embed_workers",
+        "chunk_overlap",
+        "ocr_engine",
+        "ocr_base_url",
+        "ocr_model",
+        "ocr_api_key_cmd",
+    }
     if key not in valid_keys:
         print(
             f"Invalid key. Valid keys: {', '.join(sorted(valid_keys))}", file=sys.stderr
         )
         sys.exit(1)
+
+    if key == "ocr_engine" and value not in ("local", "vlm"):
+        print("ocr_engine must be 'local' or 'vlm'", file=sys.stderr)
+        sys.exit(1)
+    if key in ("embed_workers", "chunk_overlap"):
+        # Un solape mayor que medio chunk dejaria el chunk fuera de su vector.
+        minimum, maximum = (1, 1000) if key == "embed_workers" else (0, MAX_OVERLAP)
+        try:
+            value = int(value)
+            if not minimum <= value <= maximum:
+                raise ValueError
+        except ValueError:
+            print(
+                f"{key} must be an integer from {minimum} to {maximum}", file=sys.stderr
+            )
+            sys.exit(1)
+
+    if key == "ocr_base_url" and value:
+        from urllib.parse import urlparse
+
+        url = urlparse(value)
+        if url.scheme != "https" and url.hostname not in (
+            "localhost",
+            "127.0.0.1",
+            "::1",
+        ):
+            print(
+                "  Warning: ocr_base_url is not HTTPS: images and the API key "
+                "travel unencrypted.",
+                file=sys.stderr,
+            )
 
     old_value = config.data.get(key)
     config.data[key] = value
@@ -668,6 +1276,7 @@ def cmd_config_set(args, config):
         if config.db_path.exists():
             conn = sqlite3.connect(str(config.db_path))
             conn.execute("DELETE FROM embeddings")
+            bump_vectors_rev(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_model', ?)",
                 (value,),
@@ -701,6 +1310,7 @@ def cmd_index(args, config):
             f"Embedding model changed ({stored_model[0]} -> {config.embed_model}). Clearing old embeddings."
         )
         conn.execute("DELETE FROM embeddings")
+        bump_vectors_rev(conn)
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_model', ?)",
             (config.embed_model,),
@@ -709,6 +1319,14 @@ def cmd_index(args, config):
 
     # Check embeddings availability (auto-pull if needed)
     has_embeddings = ensure_embeddings_ready(config)
+
+    images_ok = bool(config.image_dirs) and config.images_enabled()
+    if config.image_dirs and not images_ok:
+        print(
+            f"  Warning: OCR engine '{config.ocr_engine}' not available; images are "
+            "left out of the index until it is.",
+            file=sys.stderr,
+        )
 
     # Gather all current files across all directories
     current_files = {}  # absolute_path -> (dir_str, mtime_ns, size)
@@ -720,9 +1338,14 @@ def cmd_index(args, config):
             )
             continue
         dir_str = str(dp)
+        extensions = config.extensions
+        if dir_str in config.image_dirs and images_ok:
+            extensions = extensions | IMAGE_EXTS
         for abs_path, _, mtime_ns, size in walk_directory(
-            dp, config.extensions, config.skip_dirs
+            dp, extensions, config.skip_dirs
         ):
+            if Path(abs_path).suffix.lower() in IMAGE_EXTS and size < IMAGE_MIN_BYTES:
+                continue
             current_files[abs_path] = (dir_str, mtime_ns, size)
 
     # Get stored file states
@@ -747,6 +1370,9 @@ def cmd_index(args, config):
 
     if not to_index and not to_remove:
         print("Index is up to date.")
+        _set_last_index(conn)
+        conn.commit()
+        warn_truncated_embeds(conn)
         conn.close()
         return
 
@@ -757,81 +1383,108 @@ def cmd_index(args, config):
         conn.execute("DELETE FROM chunks WHERE file_path = ?", (path,))
         conn.execute("DELETE FROM files WHERE path = ?", (path,))
     conn.commit()
+    # Sin embeddings que sobrevivan al borrado (indice nuevo, modelo cambiado
+    # o todos los ficheros cambiados), todos los de este run usan el recorte
+    # actual.
+    fresh_embeds = not conn.execute("SELECT 1 FROM embeddings LIMIT 1").fetchone()
 
     # Index new/changed files
     total_chunks = 0
     embed_queue = []
     failed_ids = []  # chunk_ids whose embedding failed during this run
+    workers = args.workers or config.embed_workers
+    embedder = _Embedder(config, conn, workers) if has_embeddings else None
 
-    for i, path in enumerate(to_index, 1):
-        full_path = Path(path)
-        dir_str, mtime_ns, size = current_files[path]
-        try:
-            text, is_markdown = extract_text(full_path)
-        except (OSError, PermissionError) as e:
-            print(f"  Skip {path}: {e}", file=sys.stderr)
-            continue
-        except Exception as e:  # noqa: BLE001
-            # Documento corrupto o no soportado. Se registra sin chunks para
-            # no reintentar la conversion hasta que cambie el fichero.
-            print(f"  Skip {path}: conversion failed: {e}", file=sys.stderr)
+    path = None
+    ocr_off = False
+    try:
+        for i, path in enumerate(to_index, 1):
+            full_path = Path(path)
+            dir_str, mtime_ns, size = current_files[path]
+            if ocr_off and full_path.suffix.lower() in IMAGE_EXTS:
+                continue
+            try:
+                text, is_markdown = extract_text(full_path, config)
+            except OcrConfigError as e:
+                # Clave caducada o modelo mal escrito: fallaran todas. Se
+                # deja el OCR para el siguiente run en vez de subir cada
+                # imagen para nada.
+                print(f"  {e}. Images are skipped in this run.", file=sys.stderr)
+                ocr_off = True
+                continue
+            except (OSError, PermissionError) as e:
+                print(f"  Skip {path}: {e}", file=sys.stderr)
+                continue
+            except Exception as e:  # noqa: BLE001
+                # Documento corrupto o no soportado. Se registra sin chunks para
+                # no reintentar la conversion hasta que cambie el fichero.
+                print(f"  Skip {path}: conversion failed: {e}", file=sys.stderr)
+                conn.execute(
+                    "INSERT INTO files (path, directory, mtime_ns, size) VALUES (?, ?, ?, ?)",
+                    (path, dir_str, mtime_ns, size),
+                )
+                continue
+
             conn.execute(
                 "INSERT INTO files (path, directory, mtime_ns, size) VALUES (?, ?, ?, ?)",
                 (path, dir_str, mtime_ns, size),
             )
-            continue
 
-        conn.execute(
-            "INSERT INTO files (path, directory, mtime_ns, size) VALUES (?, ?, ?, ?)",
-            (path, dir_str, mtime_ns, size),
-        )
+            if is_markdown:
+                chunks = chunk_markdown(text)
+            else:
+                chunks = chunk_plaintext(text)
+            # Un OCR sin texto (o un fichero vacio) no deja chunks vacios: no
+            # aportan nada y ocupan sitio en los resultados.
+            chunks = [(h, c) for h, c in chunks if c.strip()]
 
-        if is_markdown:
-            chunks = chunk_markdown(text)
-        else:
-            chunks = chunk_plaintext(text)
+            prev_content = ""
+            for idx, (heading, content) in enumerate(chunks):
+                cur = conn.execute(
+                    "INSERT INTO chunks (file_path, chunk_index, heading, content) VALUES (?, ?, ?, ?)",
+                    (path, idx, heading, content),
+                )
+                total_chunks += 1
+                if has_embeddings and len(content.strip()) >= 50:
+                    embed_text = embed_text_for(
+                        heading, content, prev_content, config.chunk_overlap
+                    )
+                    embed_queue.append((cur.lastrowid, embed_text[:EMBED_MAX_CHARS]))
+                prev_content = content
 
-        for idx, (heading, content) in enumerate(chunks):
-            cur = conn.execute(
-                "INSERT INTO chunks (file_path, chunk_index, heading, content) VALUES (?, ?, ?, ?)",
-                (path, idx, heading, content),
-            )
-            total_chunks += 1
-            if has_embeddings and len(content.strip()) >= 50:
-                # Prefix heading for better embedding context
-                embed_text = f"{heading}: {content}" if heading else content
-                embed_queue.append((cur.lastrowid, embed_text[:8000]))
+                if has_embeddings and len(embed_queue) >= BATCH_SIZE:
+                    failed_ids += embedder.submit(embed_queue)
+                    embed_queue = []
 
-            if has_embeddings and len(embed_queue) >= BATCH_SIZE:
-                failed_ids += _process_embed_batch(config, conn, embed_queue)
-                embed_queue = []
+            if i % 20 == 0:
+                print(f"  {i}/{len(to_index)} files...")
+                conn.commit()
 
-        if i % 20 == 0:
-            print(f"  {i}/{len(to_index)} files...")
-            conn.commit()
-
-    if has_embeddings and embed_queue:
-        failed_ids += _process_embed_batch(config, conn, embed_queue)
+        if has_embeddings:
+            if embed_queue:
+                failed_ids += embedder.submit(embed_queue)
+            failed_ids += embedder.finish()
+    except BaseException:
+        # Ctrl-C o fallo a mitad: los ficheros ya guardados con lotes aun en
+        # vuelo quedan marcados para reintentar, o el incremental siguiente
+        # los daria por completos sin embeddings.
+        if embedder is not None:
+            pending = [cid for cid, _ in embed_queue] + embedder.abort()
+            _mark_for_retry(conn, failed_ids + pending)
+        if path is not None:
+            # El fichero en curso puede tener solo parte de sus chunks.
+            conn.execute("UPDATE files SET mtime_ns = -1 WHERE path = ?", (path,))
+        bump_vectors_rev(conn)
+        conn.commit()
+        conn.close()
+        raise
 
     # Any file with a failed embedding is unmarked (mtime_ns = -1) so the next
     # incremental run re-indexes it. We keep its chunks for now, so the file
     # stays searchable (FTS + whatever embeddings did succeed) in the meantime.
-    if failed_ids:
-        placeholders = ",".join("?" * len(failed_ids))
-        failed_files = {
-            row[0]
-            for row in conn.execute(
-                f"SELECT DISTINCT file_path FROM chunks WHERE id IN ({placeholders})",
-                failed_ids,
-            )
-        }
-        for fp in failed_files:
-            conn.execute("UPDATE files SET mtime_ns = -1 WHERE path = ?", (fp,))
-        print(
-            f"  Warning: {len(failed_ids)} chunk(s) across {len(failed_files)} file(s) "
-            f"failed to embed; those files will be re-indexed on the next run.",
-            file=sys.stderr,
-        )
+    _mark_for_retry(conn, failed_ids)
+
+    bump_vectors_rev(conn)
 
     # Store the model used for these embeddings
     if has_embeddings:
@@ -839,7 +1492,14 @@ def cmd_index(args, config):
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_model', ?)",
             (config.embed_model,),
         )
+        if args.full or fresh_embeds:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_max_chars', ?)",
+                (str(EMBED_MAX_CHARS),),
+            )
+    _set_last_index(conn)
     conn.commit()
+    warn_truncated_embeds(conn)
     print(f"Done. {len(to_index)} files, {total_chunks} chunks indexed.")
     if has_embeddings:
         embed_count = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
@@ -847,8 +1507,107 @@ def cmd_index(args, config):
     conn.close()
 
 
-def _process_embed_batch(config, conn, queue):
-    """Embed a batch of (chunk_id, text) and store the vectors.
+def embed_text_for(heading, content, prev_content="", overlap=0):
+    """Texto que se embebe para un chunk.
+
+    Lleva delante el titulo y, con `chunk_overlap`, el final del chunk
+    anterior del mismo fichero: una idea partida en la frontera de dos
+    chunks queda en el vector de los dos. Solo afecta al vector; el texto
+    guardado y el indice de texto no se repiten.
+    """
+    if overlap and prev_content:
+        content = f"...{prev_content[-overlap:]}\n\n{content}"
+    return f"{heading}: {content}" if heading else content
+
+
+def _mark_for_retry(conn, chunk_ids):
+    """Pone mtime_ns = -1 a los ficheros de esos chunks para reindexarlos."""
+    if not chunk_ids:
+        return
+    failed_files = set()
+    for i in range(0, len(chunk_ids), 500):
+        part = chunk_ids[i : i + 500]
+        placeholders = ",".join("?" * len(part))
+        failed_files |= {
+            row[0]
+            for row in conn.execute(
+                f"SELECT DISTINCT file_path FROM chunks WHERE id IN ({placeholders})",
+                part,
+            )
+        }
+    for fp in failed_files:
+        conn.execute("UPDATE files SET mtime_ns = -1 WHERE path = ?", (fp,))
+    print(
+        f"  Warning: {len(chunk_ids)} chunk(s) across {len(failed_files)} file(s) "
+        f"failed to embed; those files will be re-indexed on the next run.",
+        file=sys.stderr,
+    )
+
+
+class _Embedder:
+    """Pide embeddings en varios hilos y los guarda desde el hilo principal.
+
+    Los hilos solo hacen HTTP; sqlite3 no se comparte entre hilos. Como mucho
+    hay 2 lotes por hilo en vuelo, para no llenar la memoria si el servidor
+    va mas lento que la lectura de ficheros.
+    """
+
+    def __init__(self, config, conn, workers):
+        if config.embed_backend == "openai":
+            # Resolver la clave aqui, en el hilo principal, antes de los hilos.
+            config.embed_api_key
+        self.config = config
+        self.conn = conn
+        self.max_pending = workers * 2
+        self.pool = ThreadPoolExecutor(max_workers=workers)
+        self.pending = deque()
+
+    def submit(self, queue):
+        """Encola un lote. Devuelve los fallos de los lotes ya terminados."""
+        ids = [q[0] for q in queue]
+        texts = [q[1] for q in queue]
+        future = self.pool.submit(get_embeddings_batch, self.config, texts)
+        self.pending.append((ids, future))
+        failed = []
+        while len(self.pending) >= self.max_pending:
+            failed += self._drain_one()
+        return failed
+
+    def finish(self):
+        failed = []
+        while self.pending:
+            failed += self._drain_one()
+        self.pool.shutdown()
+        return failed
+
+    def abort(self):
+        """Cancela lo pendiente sin esperar. Devuelve los chunk_ids sin guardar."""
+        ids = [cid for batch, _ in self.pending for cid in batch]
+        self.pending.clear()
+        self.pool.shutdown(wait=False, cancel_futures=True)
+        return ids
+
+    def _drain_one(self):
+        # El lote sale de la cola cuando ya esta guardado: si llega un Ctrl-C
+        # mientras se espera, abort() aun lo ve como pendiente.
+        ids, future = self.pending[0]
+        try:
+            vectors = future.result()
+        except Exception as e:  # noqa: BLE001
+            # Un fallo inesperado en un hilo no debe tirar la indexacion: el
+            # lote cuenta como fallo transitorio y se reintenta en otro run.
+            print(f"  Warning: embedding batch failed: {e}", file=sys.stderr)
+            self.pending.popleft()
+            return list(ids)
+        # Tambien se guarda antes de sacarlo: si el guardado falla o llega
+        # un Ctrl-C, abort() lo marca para reintentar.
+        failed = _store_embed_batch(self.conn, ids, vectors)
+        self.pending.popleft()
+        return failed
+
+
+def _store_embed_batch(conn, ids, vectors):
+    """Store the vectors of a batch of chunk ids.
 
     Returns the list of chunk_ids that failed *transiently* (worth retrying),
     so the caller can avoid marking their source file as fully indexed —
@@ -857,9 +1616,6 @@ def _process_embed_batch(config, conn, queue):
     specific text) are skipped silently: their chunks stay FTS-only and the
     file is left marked as indexed, so we don't loop on them every run.
     """
-    ids = [q[0] for q in queue]
-    texts = [q[1] for q in queue]
-    vectors = get_embeddings_batch(config, texts)
     if vectors and len(vectors) == len(ids):
         failed = []
         for chunk_id, vec in zip(ids, vectors):
@@ -890,19 +1646,26 @@ def cmd_search(args, config):
         print("No query provided.", file=sys.stderr)
         sys.exit(1)
 
-    if args.semantic:
-        results = search_semantic(config, conn, query, args.limit)
-    elif args.both:
-        fts_results = search_fts(conn, query, args.limit)
-        sem_results = search_semantic(config, conn, query, args.limit)
-        results = merge_results(fts_results, sem_results, args.limit)
-    else:
-        results = search_fts(conn, query, args.limit)
-
-    # Apply directory filter if specified
+    dir_prefix = None
     if args.dir:
-        filter_dir = str(Path(args.dir).resolve())
-        results = [r for r in results if r["path"].startswith(filter_dir)]
+        # Con separador final: --dir ~/notes no debe incluir ~/notes-viejas.
+        dir_prefix = str(Path(args.dir).expanduser().resolve()).rstrip(os.sep) + os.sep
+
+    degraded = False
+    if args.semantic or args.both:
+        sem_results = search_semantic(
+            config, conn, query, args.limit, dir_prefix, args.max_chars
+        )
+        degraded = sem_results is None
+        sem_results = sem_results or []
+    if args.semantic:
+        results = sem_results
+    else:
+        results = search_fts(
+            conn, query, args.limit, args.strict, dir_prefix, args.max_chars
+        )
+        if args.both:
+            results = merge_results(results, sem_results, args.limit)
 
     if args.json:
         print(json.dumps(results, ensure_ascii=False, indent=2))
@@ -910,127 +1673,246 @@ def cmd_search(args, config):
         format_results(results, config)
 
     conn.close()
+    if degraded:
+        # La busqueda semantica pedida no se hizo: los resultados (si los
+        # hay) son solo de texto. Codigo propio para que un agente lo sepa.
+        sys.exit(EXIT_SEMANTIC_UNAVAILABLE)
 
 
-def search_fts(conn, query, limit=10):
-    """Full-text search using FTS5 BM25."""
-    fts_query = query.replace('"', '""')
+FTS_OPERATORS = {"AND", "OR", "NOT", "NEAR"}
 
+
+def _fts_terms(query):
+    """Palabras de la consulta, cada una entre comillas para FTS5.
+
+    Quita los operadores de FTS5 y las palabras con `-` delante: quien
+    escribe `-cilium` quiere excluir cilium, no buscarlo en el plan B.
+    """
+    terms = []
+    for token in query.split():
+        if token in FTS_OPERATORS or token.startswith("-"):
+            continue
+        terms += re.findall(r"\w+", token)
+    return ['"' + t.replace('"', '""') + '"' for t in terms]
+
+
+def _has_fts_operators(query):
+    return any(token in FTS_OPERATORS for token in query.split())
+
+
+def _fts_rows(conn, match, limit, dir_prefix=None):
+    if limit < 1:
+        # En SQLite, LIMIT negativo es "sin limite".
+        return []
+    # El filtro de directorio va dentro de la consulta, antes del LIMIT: si
+    # se aplica despues, los N mejores de otras carpetas lo dejan vacio.
+    where_dir, params = "", [match]
+    if dir_prefix:
+        where_dir = "AND substr(c.file_path, 1, ?) = ?"
+        params += [len(dir_prefix), dir_prefix]
     try:
-        rows = conn.execute(
-            """
-            SELECT c.file_path, c.heading, snippet(chunks_fts, 0, '>>>', '<<<', '...', 40) as snip,
-                   bm25(chunks_fts) as score
+        return conn.execute(
+            f"""
+            SELECT c.id, c.file_path, c.heading, c.content,
+                   snippet(chunks_fts, 0, '>>>', '<<<', '...', 40) as snip,
+                   bm25(chunks_fts, {BM25_WEIGHTS[0]}, {BM25_WEIGHTS[1]}) as score
             FROM chunks_fts
             JOIN chunks c ON c.id = chunks_fts.rowid
-            WHERE chunks_fts MATCH ?
-            ORDER BY bm25(chunks_fts)
+            WHERE chunks_fts MATCH ? {where_dir}
+            ORDER BY score
             LIMIT ?
             """,
-            (fts_query, limit),
+            params + [limit],
         ).fetchall()
     except sqlite3.OperationalError:
-        try:
-            rows = conn.execute(
-                """
-                SELECT c.file_path, c.heading, snippet(chunks_fts, 0, '>>>', '<<<', '...', 40) as snip,
-                       bm25(chunks_fts) as score
-                FROM chunks_fts
-                JOIN chunks c ON c.id = chunks_fts.rowid
-                WHERE chunks_fts MATCH ?
-                ORDER BY bm25(chunks_fts)
-                LIMIT ?
-                """,
-                (f'"{fts_query}"', limit),
-            ).fetchall()
-        except sqlite3.OperationalError:
-            return []
+        return None
+
+
+def search_fts(conn, query, limit=10, strict=False, dir_prefix=None, max_chars=None):
+    """Full-text search using FTS5 BM25.
+
+    FTS5 exige todas las palabras. Si eso no da nada y no es `strict`, se
+    repite con OR: con consultas largas basta con que falte una palabra
+    para perder el documento, y BM25 ya pone primero los que tienen mas.
+    """
+    terms = _fts_terms(query)
+    # Con operadores explicitos (AND, OR, NOT, NEAR) quien busca ya decide
+    # la logica: no se cambia por un OR.
+    strict = strict or _has_fts_operators(query)
+    # La consulta tal cual admite sintaxis FTS5 (frases, prefijo*). Si no es
+    # sintaxis valida o no da nada, se buscan las palabras sueltas con AND.
+    rows = _fts_rows(conn, query, limit, dir_prefix)
+    and_query = " ".join(terms)
+    if rows is None:
+        # Sintaxis invalida. Con operadores no se adivina: quitar un NOT
+        # convertiria una exclusion en una inclusion.
+        rows = (
+            []
+            if _has_fts_operators(query)
+            else _fts_rows(conn, and_query, limit, dir_prefix)
+        )
+    elif not rows and not strict and and_query != query:
+        rows = _fts_rows(conn, and_query, limit, dir_prefix)
+    if not rows and not strict and len(terms) > 1:
+        rows = _fts_rows(conn, " OR ".join(terms), limit, dir_prefix)
 
     results = []
-    for path, heading, snippet_text, score in rows:
-        clean_snippet = snippet_text.replace(">>>", "").replace("<<<", "")
+    for chunk_id, path, heading, content, snippet_text, score in rows or []:
+        if max_chars:
+            snippet = clip_text(content, max_chars)
+        else:
+            snippet = snippet_text.replace(">>>", "").replace("<<<", "")
         results.append(
-            {
-                "path": path,
-                "heading": heading or "",
-                "snippet": clean_snippet,
-                "score": round(-score, 4),
-                "method": "fts",
-            }
+            _result(chunk_id, path, heading, snippet, round(-score, 4), "fts")
         )
+    _add_mtimes(conn, results)
     return results
 
 
-def search_semantic(config, conn, query, limit=10):
-    """Semantic search using embeddings."""
-    vectors = get_embeddings_batch(config, [query])
-    if not vectors or vectors[0] is PERMANENT_FAIL or not vectors[0]:
+def clip_text(text, max_chars):
+    """Corta a max_chars como mucho, en el ultimo espacio si cae en la segunda
+    mitad del corte; si no (URL, codigo sin espacios), corta donde toque."""
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 3:
+        return text[:max_chars]
+    # Los "..." cuentan dentro del limite.
+    cut = text[: max_chars - 3]
+    space = cut.rfind(" ")
+    if space > len(cut) // 2:
+        cut = cut[:space]
+    return cut.rstrip() + "..."
+
+
+def _result(chunk_id, path, heading, snippet, score, method):
+    return {
+        "path": path,
+        "heading": heading or "",
+        "snippet": snippet,
+        "score": score,
+        "method": method,
+        "chunk_id": chunk_id,
+    }
+
+
+def _add_mtimes(conn, results):
+    """Anade a cada resultado la fecha del fichero (ISO 8601, UTC).
+
+    Un agente la usa para juzgar si el dato es reciente sin abrir el fichero.
+    Sale del indice; si el fichero esta marcado para reindexar (-1), del disco.
+    """
+    cache = {}
+    for r in results:
+        path = r["path"]
+        if path not in cache:
+            row = conn.execute(
+                "SELECT mtime_ns FROM files WHERE path = ?", (path,)
+            ).fetchone()
+            ns = row[0] if row else None
+            if ns is None or ns < 0:
+                try:
+                    ns = os.stat(path).st_mtime_ns
+                except OSError:
+                    ns = None
+            cache[path] = (
+                datetime.fromtimestamp(ns / 1e9, timezone.utc).isoformat(
+                    timespec="seconds"
+                )
+                if ns is not None
+                else None
+            )
+        r["mtime"] = cache[path]
+
+
+def search_semantic(config, conn, query, limit=10, dir_prefix=None, max_chars=None):
+    """Semantic search using embeddings.
+
+    Devuelve None si la busqueda no se pudo hacer (backend caido, modelo
+    ausente) para distinguirlo de "sin resultados".
+    """
+    # Un reintento: quien busca (a menudo un agente) espera la respuesta, y
+    # los 5 de la indexacion suman un minuto de esperas con el backend caido.
+    vectors = get_embeddings_batch(config, [query], retries=SEARCH_EMBED_RETRIES)
+    if vectors and vectors[0] is PERMANENT_FAIL:
+        # El backend responde, pero esta consulta no se puede embeber: no es
+        # una caida (codigo 3), es una consulta sin resultados semanticos.
+        print("Semantic search: this query cannot be embedded.", file=sys.stderr)
+        return []
+    if not vectors or not vectors[0]:
         print(
-            "Semantic search unavailable (ollama not reachable, model missing, or query not embeddable).",
+            "Semantic search unavailable (embedding backend not reachable, model missing, or query not embeddable).",
             file=sys.stderr,
         )
-        return []
+        return None
 
     query_vec = vectors[0]
 
-    rows = conn.execute(
-        """
-        SELECT e.chunk_id, e.vector, c.file_path, c.heading, c.content
-        FROM embeddings e
-        JOIN chunks c ON c.id = e.chunk_id
-        """
-    ).fetchall()
-
-    if not rows:
+    if not conn.execute("SELECT 1 FROM embeddings LIMIT 1").fetchone():
         print("No embeddings in index. Re-run: ownsearch index", file=sys.stderr)
         return []
 
-    scored = []
-    for chunk_id, vec_blob, path, heading, content in rows:
-        vec = unpack_vector(vec_blob)
-        sim = cosine_sim(query_vec, vec)
-        scored.append((sim, path, heading, content))
+    allowed = None
+    if dir_prefix:
+        allowed = {
+            row[0]
+            for row in conn.execute(
+                "SELECT id FROM chunks WHERE substr(file_path, 1, ?) = ?",
+                (len(dir_prefix), dir_prefix),
+            )
+        }
+        if not allowed:
+            return []
 
-    scored.sort(key=lambda x: x[0], reverse=True)
+    if _numpy() is not None:
+        top = top_chunks_numpy(config.db_path, conn, query_vec, limit, allowed)
+    else:
+        top = top_chunks_python(conn, query_vec, limit, allowed)
 
     results = []
-    for sim, path, heading, content in scored[:limit]:
-        snippet = content[:200].replace("\n", " ")
+    for sim, chunk_id in top:
+        row = conn.execute(
+            "SELECT file_path, heading, content FROM chunks WHERE id = ?", (chunk_id,)
+        ).fetchone()
+        if not row:
+            continue
+        path, heading, content = row
+        if max_chars:
+            snippet = clip_text(content, max_chars)
+        else:
+            snippet = clip_text(content.replace("\n", " "), 200)
         results.append(
-            {
-                "path": path,
-                "heading": heading or "",
-                "snippet": snippet,
-                "score": round(sim, 4),
-                "method": "semantic",
-            }
+            _result(chunk_id, path, heading, snippet, round(sim, 4), "semantic")
         )
+    _add_mtimes(conn, results)
     return results
 
 
 def merge_results(fts_results, sem_results, limit=10):
-    """Merge results using reciprocal rank fusion."""
+    """Merge results using reciprocal rank fusion.
+
+    La clave es el chunk: los trozos de una seccion larga comparten fichero
+    y titulo, y con (path, heading) se fundian en uno. `methods` dice que
+    busquedas lo encontraron; si son las dos, suele ser lo mas relevante.
+    """
     K = 60
     scores = {}
     all_results = {}
+    methods = {}
 
-    for rank, r in enumerate(fts_results):
-        key = (r["path"], r["heading"])
-        scores[key] = scores.get(key, 0) + 1.0 / (K + rank + 1)
-        if key not in all_results:
-            all_results[key] = r
-
-    for rank, r in enumerate(sem_results):
-        key = (r["path"], r["heading"])
-        scores[key] = scores.get(key, 0) + 1.0 / (K + rank + 1)
-        if key not in all_results:
-            all_results[key] = r
+    for method, results in (("fts", fts_results), ("semantic", sem_results)):
+        for rank, r in enumerate(results):
+            key = r["chunk_id"]
+            scores[key] = scores.get(key, 0) + 1.0 / (K + rank + 1)
+            methods.setdefault(key, []).append(method)
+            if key not in all_results:
+                all_results[key] = r
 
     merged = []
     for key, r in all_results.items():
         r = r.copy()
         r["score"] = round(scores.get(key, 0), 4)
         r["method"] = "combined"
+        r["methods"] = methods[key]
         merged.append(r)
 
     merged.sort(key=lambda x: x["score"], reverse=True)
@@ -1052,12 +1934,81 @@ def format_results(results, config):
         print(f"\033[1;33m[{score:.2f}]\033[0m \033[1m{path}\033[0m")
         if heading:
             print(f"       \033[36m{heading}\033[0m")
-        print(f"       {snippet[:200]}")
+        print(f"       {snippet}")
         print()
 
 
-def cmd_status(config):
+def status_data(config):
+    """Estado en forma de dict, para `status --json`."""
+    if config.embed_backend == "openai":
+        url = config.embed_base_url
+    else:
+        url = config.ollama_url
+    reachable = ollama_available(config)
+    data = {
+        "version": __version__,
+        "db_path": str(config.db_path),
+        "db_bytes": None,
+        "embed_backend": config.embed_backend,
+        "embed_url": url,
+        "embed_reachable": reachable,
+        "embed_model": config.embed_model,
+        "embed_model_available": bool(reachable and ollama_has_model(config)),
+        "directories": [],
+        "chunks": 0,
+        "embeddings": 0,
+        "embed_max_chars": None,
+        "last_index": None,
+    }
+    conn = None
+    if config.db_path.exists():
+        data["db_bytes"] = config.db_path.stat().st_size
+        conn = sqlite3.connect(str(config.db_path))
+        # Un fichero sin tablas (index cortado antes de crearlas) o que no es
+        # SQLite cuenta como indice vacio, no como error.
+        try:
+            has_tables = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='files'"
+            ).fetchone()
+        except sqlite3.DatabaseError:
+            has_tables = None
+        if not has_tables:
+            conn.close()
+            conn = None
+    try:
+        for d in config.data.get("directories", []):
+            files = None
+            if conn:
+                files = conn.execute(
+                    "SELECT COUNT(*) FROM files WHERE directory = ?", (d,)
+                ).fetchone()[0]
+            data["directories"].append(
+                {"path": d, "exists": Path(d).exists(), "files": files}
+            )
+        if conn:
+            data["chunks"] = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+            data["embeddings"] = conn.execute(
+                "SELECT COUNT(*) FROM embeddings"
+            ).fetchone()[0]
+            meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+            data["last_index"] = meta.get("last_index")
+            if data["embeddings"]:
+                # Sin la clave, los embeddings son de 0.2.0 o anterior.
+                try:
+                    data["embed_max_chars"] = int(meta.get("embed_max_chars") or 2000)
+                except ValueError:
+                    data["embed_max_chars"] = 2000
+    finally:
+        if conn:
+            conn.close()
+    return data
+
+
+def cmd_status(config, as_json=False):
     """Show status of ownsearch."""
+    if as_json:
+        print(json.dumps(status_data(config), ensure_ascii=False, indent=2))
+        return
     print(f"ownsearch v{__version__}")
     print(f"Config: {config.config_file}")
     print(f"Database: {config.db_path}", end="")
@@ -1100,12 +2051,23 @@ def cmd_status(config):
             total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
             embeds = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
             print(f"\n  Total: {total} chunks, {embeds} embeddings")
+            warn_truncated_embeds(conn)
             conn.close()
     else:
         print("  (none — use 'ownsearch add-dir PATH')")
 
 
 # --- Main ---
+
+
+def _positive_int(value):
+    try:
+        n = int(value)
+    except ValueError:
+        n = 0
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer: {value}")
+    return n
 
 
 def main():
@@ -1121,6 +2083,11 @@ def main():
     # add-dir
     add = sub.add_parser("add-dir", help="Add a directory to index")
     add.add_argument("path", help="Directory path to add")
+    add.add_argument(
+        "--images",
+        action="store_true",
+        help="Also index images in it with OCR (engine: ocr_engine)",
+    )
 
     # remove-dir
     rm = sub.add_parser("remove-dir", help="Remove a directory from index")
@@ -1132,15 +2099,32 @@ def main():
     # index
     idx = sub.add_parser("index", help="Index all configured directories")
     idx.add_argument("--full", action="store_true", help="Force full re-index")
+    idx.add_argument(
+        "--workers",
+        type=_positive_int,
+        help=f"Parallel embedding requests (default: embed_workers, {DEFAULT_EMBED_WORKERS})",
+    )
 
     # search
     srch = sub.add_parser("search", help="Search the index")
     srch.add_argument("query", nargs="+", help="Search query")
     srch.add_argument("--semantic", action="store_true", help="Use semantic search")
     srch.add_argument("--both", action="store_true", help="Combined FTS + semantic")
+    srch.add_argument(
+        "--strict",
+        action="store_true",
+        help="Full-text: require every word (no OR fallback)",
+    )
     srch.add_argument("--json", action="store_true", help="Output as JSON")
-    srch.add_argument("--limit", type=int, default=10, help="Max results (default: 10)")
+    srch.add_argument(
+        "--limit", type=_positive_int, default=10, help="Max results (default: 10)"
+    )
     srch.add_argument("--dir", help="Filter results to a specific directory")
+    srch.add_argument(
+        "--max-chars",
+        type=_positive_int,
+        help="Return up to N characters of each chunk instead of a short snippet",
+    )
 
     # config
     cfg = sub.add_parser("config", help="Show or set configuration")
@@ -1151,7 +2135,8 @@ def main():
     cfg_set.add_argument("value", help="Config value")
 
     # status
-    sub.add_parser("status", help="Show ownsearch status")
+    st = sub.add_parser("status", help="Show ownsearch status")
+    st.add_argument("--json", action="store_true", help="Output as JSON")
 
     args = parser.parse_args()
     config = Config()
@@ -1163,7 +2148,16 @@ def main():
     elif args.command == "list-dirs":
         cmd_list_dirs(config)
     elif args.command == "index":
-        cmd_index(args, config)
+        try:
+            cmd_index(args, config)
+        except KeyboardInterrupt:
+            # cmd_index ya guardo lo hecho y marco lo pendiente. Salir sin
+            # esperar a los hilos: una peticion de embeddings colgada puede
+            # tardar minutos en soltar.
+            print("\nInterrupted.", file=sys.stderr)
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(130)
     elif args.command == "search":
         cmd_search(args, config)
     elif args.command == "config":
@@ -1172,7 +2166,7 @@ def main():
         else:
             cmd_config_show(config)
     elif args.command == "status":
-        cmd_status(config)
+        cmd_status(config, args.json)
     else:
         parser.print_help()
 

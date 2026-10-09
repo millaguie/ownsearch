@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ownsearch"
-version = "0.2.0"
+version = "0.3.0"
 description = "Smart full-text and semantic search for your local documents"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,6 +31,7 @@ Issues = "https://github.com/millaguie/ownsearch/issues"
 
 [project.optional-dependencies]
 docs = ["docvortex>=0.5"]
+fast = ["numpy>=1.24"]
 
 [project.scripts]
 ownsearch = "ownsearch:main"
