@@ -316,12 +316,12 @@ class TestSemantic(Base):
         if ownsearch.np is not None:
             self.assertEqual(
                 ownsearch.top_chunks_numpy(
-                    self.config.db_path, self.conn(), fake_vec("q"), -30
+                    self.config.db_path, self.conn(), fake_vec("q"), -5
                 ),
                 [],
             )
         self.assertEqual(
-            ownsearch.top_chunks_python(self.conn(), fake_vec("q"), -30), []
+            ownsearch.top_chunks_python(self.conn(), fake_vec("q"), -5), []
         )
         with self.assertRaises(Exception):
             ownsearch._positive_int("-30")
