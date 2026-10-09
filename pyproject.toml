@@ -31,6 +31,7 @@ Issues = "https://github.com/millaguie/ownsearch/issues"
 
 [project.optional-dependencies]
 docs = ["docvortex>=0.5"]
+fast = ["numpy>=1.24"]
 
 [project.scripts]
 ownsearch = "ownsearch:main"

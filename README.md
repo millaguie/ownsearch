@@ -44,6 +44,12 @@ ownsearch index --full
 # Full-text search (fast, literal)
 ownsearch search "kubernetes cilium"
 
+# Full-text search that requires every word (no OR fallback)
+ownsearch search --strict "kubernetes cilium"
+
+# Parallel embedding requests while indexing (default: 4)
+ownsearch index --workers 8
+
 # Semantic search (finds related content even with different wording)
 ownsearch search --semantic "network security"
 
@@ -77,6 +83,8 @@ ownsearch list-dirs         # List indexed directories
 - **Incremental indexing**: By default, only processes files whose mtime/size changed since the last run. Deleted files are cleaned up automatically.
 - **Graceful degradation**: If ollama is unavailable, FTS5 search still works (semantic search is skipped).
 - **Smart chunking**: Splits by markdown headings. Large files are partitioned into ~4000 char chunks while preserving heading context.
+- **Full-text fallback**: Full-text search first requires every word. If that finds nothing, it retries with any word, and BM25 ranks first the chunks with more words. Use `--strict` to turn this off. Matches in headings count double.
+- **Parallel indexing**: Embedding requests run in parallel (`--workers`, or `ownsearch config set embed_workers N`).
 - **Retry with backoff**: Embedding requests retry on failure with exponential backoff to handle transient server issues.
 
 ## Supported file types
@@ -98,6 +106,18 @@ pipx inject ownsearch docvortex
 With it, ownsearch converts these files to Markdown with [DocVortex](https://github.com/myhloli/DocVortex) and indexes them by heading: `.pdf`, `.doc`, `.docx`, `.rtf`, `.ppt`, `.pptx`, `.xls`, `.xlsx`, `.odt`, `.ods`, `.odp`, `.html`, `.htm`, `.epub`, `.csv`, `.tsv`.
 
 - No extra config: the formats are picked up on the next `ownsearch index`.
+
+### Fast semantic search (numpy)
+
+Install the `fast` extra for large indexes:
+
+```bash
+pipx install 'ownsearch[fast]'
+# or, if ownsearch is already installed with pipx:
+pipx inject ownsearch numpy
+```
+
+With numpy, semantic search keeps the vectors in a cache next to the database (`<db_path>.vectors.npy`) and compares them all in one matrix product. Without numpy, ownsearch compares them one by one in Python, which is slow beyond some tens of thousands of chunks.
 - There is no OCR. Scanned PDFs give no text.
 - The extra is heavy (~500 MB, it pulls OpenCV and NumPy). Conversion is slower than reading text, but only changed files are converted again.
 - A file that fails to convert is skipped until it changes.

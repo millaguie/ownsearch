@@ -34,3 +34,9 @@ jobs:
         run: |
           python -c "import ownsearch"
           ownsearch --help
+      - name: Tests (stdlib only)
+        run: python -m unittest discover -s tests -t . -v
+      - name: Tests (numpy)
+        run: |
+          pip install -e .[fast]
+          python -m unittest discover -s tests -t . -v

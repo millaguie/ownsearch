@@ -13,7 +13,15 @@ import sys
 import time
 import urllib.request
 import urllib.error
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+try:
+    # Extra opcional `ownsearch[fast]`: busqueda semantica vectorizada.
+    import numpy as np
+except ImportError:
+    np = None
 
 __version__ = "0.2.0"
 
@@ -24,7 +32,13 @@ DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_EMBED_MODEL = "bge-m3"
 EMBED_DIM = 1024
 MAX_CHUNK_CHARS = 4000
+# bge-m3 admite 8192 tokens, asi que 8000 caracteres caben de sobra y el
+# fragmento entero (titulo incluido) llega al modelo.
+EMBED_MAX_CHARS = 8000
 BATCH_SIZE = 5
+DEFAULT_EMBED_WORKERS = 4
+# Peso de cada columna de chunks_fts en BM25: content, heading.
+BM25_WEIGHTS = (1.0, 2.0)
 
 INDEXABLE_EXTS = {".md", ".txt", ".org", ".rst"}
 # Formatos que se convierten a Markdown con docvortex (extra opcional
@@ -85,6 +99,7 @@ class Config:
             "embed_base_url": "",
             "embed_api_key": "",
             "embed_api_key_cmd": "",
+            "embed_workers": DEFAULT_EMBED_WORKERS,
             "directories": [],
             "extensions": list(INDEXABLE_EXTS),
             "skip_dirs": list(SKIP_DIRS),
@@ -117,9 +132,17 @@ class Config:
 
     @property
     def embed_api_key(self):
-        """Clave del backend OpenAI.
+        """Clave del backend OpenAI, calculada una sola vez.
 
-        Por orden: variable de entorno, comando (para sacarla de `pass` sin
+        Cada peticion de embeddings la pide, y con varios hilos ejecutar
+        embed_api_key_cmd en cada una lanzaria decenas de `pass` a la vez.
+        """
+        if not hasattr(self, "_embed_api_key"):
+            self._embed_api_key = self._read_embed_api_key()
+        return self._embed_api_key
+
+    def _read_embed_api_key(self):
+        """Por orden: variable de entorno, comando (para sacarla de `pass` sin
         guardarla en el config) y, como ultimo recurso, el valor literal.
         """
         env = os.environ.get("OWNSEARCH_EMBED_API_KEY")
@@ -140,6 +163,13 @@ class Config:
             except Exception as e:
                 print(f"  Warning: embed_api_key_cmd fallo: {e}", file=sys.stderr)
         return (self.data.get("embed_api_key") or "").strip()
+
+    @property
+    def embed_workers(self):
+        try:
+            return max(1, int(self.data.get("embed_workers", DEFAULT_EMBED_WORKERS)))
+        except (TypeError, ValueError):
+            return DEFAULT_EMBED_WORKERS
 
     @property
     def directories(self):
@@ -274,7 +304,7 @@ def get_embeddings_batch(config, texts):
     when the model can't embed that specific text.
     """
     # Truncate texts to avoid OOM on the server
-    truncated = [t[:2000] for t in texts]
+    truncated = [t[:EMBED_MAX_CHARS] for t in texts]
 
     # Try batch first
     embeddings = _embed_request(config, truncated)
@@ -509,6 +539,109 @@ def unpack_vector(blob):
     return struct.unpack(f"{n}f", blob)
 
 
+def bump_vectors_rev(conn):
+    """Marca la cache de vectores como caducada.
+
+    Llamalo siempre que cambie la tabla embeddings, aunque sea por borrado
+    en cascada de chunks.
+    """
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('vectors_rev', ?)",
+        (str(time.time_ns()),),
+    )
+
+
+def _vectors_rev(conn):
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'vectors_rev'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return row[0] if row else "0"
+
+
+def load_vector_matrix(db_path, conn):
+    """Matriz (n, dim) de vectores normalizados y sus chunk_ids, con numpy.
+
+    Se guarda junto a la base de datos en dos .npy y se abre con mmap: leer
+    y desempaquetar cien mil BLOBs en cada consulta cuesta mas que la propia
+    busqueda. La cache se rehace cuando cambia vectors_rev.
+    """
+    rev = _vectors_rev(conn)
+    base = str(db_path)
+    mat_path, ids_path, rev_path = (
+        base + ".vectors.npy",
+        base + ".ids.npy",
+        base + ".vectors.rev",
+    )
+    try:
+        if rev is not None and Path(rev_path).read_text() == rev:
+            return (
+                np.load(mat_path, mmap_mode="r"),
+                np.load(ids_path, mmap_mode="r"),
+            )
+    except (OSError, ValueError):
+        pass
+
+    rows = conn.execute("SELECT chunk_id, vector FROM embeddings").fetchall()
+    if not rows:
+        return np.zeros((0, 0), dtype=np.float32), np.zeros(0, dtype=np.int64)
+    # Con un solo modelo todos los vectores miden lo mismo; si hay restos de
+    # otro modelo, se usa la medida mas comun.
+    dims = {}
+    for _, blob in rows:
+        dims[len(blob)] = dims.get(len(blob), 0) + 1
+    size = max(dims, key=dims.get)
+    rows = [r for r in rows if len(r[1]) == size]
+    ids = np.fromiter((r[0] for r in rows), dtype=np.int64, count=len(rows))
+    mat = np.frombuffer(b"".join(r[1] for r in rows), dtype=np.float32)
+    mat = mat.reshape(len(rows), size // 4).copy()
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    mat /= norms
+
+    if rev is not None:
+        try:
+            for path, arr in ((mat_path, mat), (ids_path, ids)):
+                tmp = path + ".tmp"
+                with open(tmp, "wb") as f:
+                    np.save(f, arr)
+                os.replace(tmp, path)
+            Path(rev_path).write_text(rev)
+        except OSError as e:
+            print(
+                f"  Warning: no se pudo guardar la cache de vectores: {e}",
+                file=sys.stderr,
+            )
+    return mat, ids
+
+
+def top_chunks_numpy(db_path, conn, query_vec, limit):
+    """[(sim, chunk_id)] de los `limit` vectores mas parecidos."""
+    mat, ids = load_vector_matrix(db_path, conn)
+    q = np.asarray(query_vec, dtype=np.float32)
+    if mat.shape[0] == 0 or mat.shape[1] != q.shape[0]:
+        return []
+    norm = np.linalg.norm(q)
+    if norm == 0:
+        return []
+    sims = mat @ (q / norm)
+    k = min(limit, len(sims))
+    top = np.argpartition(-sims, k - 1)[:k]
+    top = top[np.argsort(-sims[top])]
+    return [(float(sims[i]), int(ids[i])) for i in top]
+
+
+def top_chunks_python(conn, query_vec, limit):
+    """Lo mismo que top_chunks_numpy, sin dependencias. Lento con mucho indice."""
+    scored = []
+    for chunk_id, vec_blob in conn.execute("SELECT chunk_id, vector FROM embeddings"):
+        scored.append((cosine_sim(query_vec, unpack_vector(vec_blob)), chunk_id))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[:limit]
+
+
 def cosine_sim(a, b):
     dot = sum(x * y for x, y in zip(a, b))
     na = math.sqrt(sum(x * x for x in a))
@@ -626,6 +759,7 @@ def cmd_remove_dir(args, config):
         (path_str,),
     )
     conn.execute("DELETE FROM files WHERE directory = ?", (path_str,))
+    bump_vectors_rev(conn)
     conn.commit()
     conn.close()
     print(f"Removed: {path_str}")
@@ -651,12 +785,21 @@ def cmd_config_set(args, config):
     key = args.key
     value = args.value
 
-    valid_keys = {"db_path", "ollama_url", "embed_model"}
+    valid_keys = {"db_path", "ollama_url", "embed_model", "embed_workers"}
     if key not in valid_keys:
         print(
             f"Invalid key. Valid keys: {', '.join(sorted(valid_keys))}", file=sys.stderr
         )
         sys.exit(1)
+
+    if key == "embed_workers":
+        try:
+            value = int(value)
+            if value < 1:
+                raise ValueError
+        except ValueError:
+            print("embed_workers must be a positive integer", file=sys.stderr)
+            sys.exit(1)
 
     old_value = config.data.get(key)
     config.data[key] = value
@@ -668,6 +811,7 @@ def cmd_config_set(args, config):
         if config.db_path.exists():
             conn = sqlite3.connect(str(config.db_path))
             conn.execute("DELETE FROM embeddings")
+            bump_vectors_rev(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_model', ?)",
                 (value,),
@@ -701,6 +845,7 @@ def cmd_index(args, config):
             f"Embedding model changed ({stored_model[0]} -> {config.embed_model}). Clearing old embeddings."
         )
         conn.execute("DELETE FROM embeddings")
+        bump_vectors_rev(conn)
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_model', ?)",
             (config.embed_model,),
@@ -762,6 +907,8 @@ def cmd_index(args, config):
     total_chunks = 0
     embed_queue = []
     failed_ids = []  # chunk_ids whose embedding failed during this run
+    workers = args.workers or config.embed_workers
+    embedder = _Embedder(config, conn, workers) if has_embeddings else None
 
     for i, path in enumerate(to_index, 1):
         full_path = Path(path)
@@ -800,18 +947,20 @@ def cmd_index(args, config):
             if has_embeddings and len(content.strip()) >= 50:
                 # Prefix heading for better embedding context
                 embed_text = f"{heading}: {content}" if heading else content
-                embed_queue.append((cur.lastrowid, embed_text[:8000]))
+                embed_queue.append((cur.lastrowid, embed_text[:EMBED_MAX_CHARS]))
 
             if has_embeddings and len(embed_queue) >= BATCH_SIZE:
-                failed_ids += _process_embed_batch(config, conn, embed_queue)
+                failed_ids += embedder.submit(embed_queue)
                 embed_queue = []
 
         if i % 20 == 0:
             print(f"  {i}/{len(to_index)} files...")
             conn.commit()
 
-    if has_embeddings and embed_queue:
-        failed_ids += _process_embed_batch(config, conn, embed_queue)
+    if has_embeddings:
+        if embed_queue:
+            failed_ids += embedder.submit(embed_queue)
+        failed_ids += embedder.finish()
 
     # Any file with a failed embedding is unmarked (mtime_ns = -1) so the next
     # incremental run re-indexes it. We keep its chunks for now, so the file
@@ -833,6 +982,8 @@ def cmd_index(args, config):
             file=sys.stderr,
         )
 
+    bump_vectors_rev(conn)
+
     # Store the model used for these embeddings
     if has_embeddings:
         conn.execute(
@@ -847,8 +998,46 @@ def cmd_index(args, config):
     conn.close()
 
 
-def _process_embed_batch(config, conn, queue):
-    """Embed a batch of (chunk_id, text) and store the vectors.
+class _Embedder:
+    """Pide embeddings en varios hilos y los guarda desde el hilo principal.
+
+    Los hilos solo hacen HTTP; sqlite3 no se comparte entre hilos. Como mucho
+    hay 2 lotes por hilo en vuelo, para no llenar la memoria si el servidor
+    va mas lento que la lectura de ficheros.
+    """
+
+    def __init__(self, config, conn, workers):
+        self.config = config
+        self.conn = conn
+        self.max_pending = workers * 2
+        self.pool = ThreadPoolExecutor(max_workers=workers)
+        self.pending = deque()
+
+    def submit(self, queue):
+        """Encola un lote. Devuelve los fallos de los lotes ya terminados."""
+        ids = [q[0] for q in queue]
+        texts = [q[1] for q in queue]
+        future = self.pool.submit(get_embeddings_batch, self.config, texts)
+        self.pending.append((ids, future))
+        failed = []
+        while len(self.pending) >= self.max_pending:
+            failed += self._drain_one()
+        return failed
+
+    def finish(self):
+        failed = []
+        while self.pending:
+            failed += self._drain_one()
+        self.pool.shutdown()
+        return failed
+
+    def _drain_one(self):
+        ids, future = self.pending.popleft()
+        return _store_embed_batch(self.conn, ids, future.result())
+
+
+def _store_embed_batch(conn, ids, vectors):
+    """Store the vectors of a batch of chunk ids.
 
     Returns the list of chunk_ids that failed *transiently* (worth retrying),
     so the caller can avoid marking their source file as fully indexed —
@@ -857,9 +1046,6 @@ def _process_embed_batch(config, conn, queue):
     specific text) are skipped silently: their chunks stay FTS-only and the
     file is left marked as indexed, so we don't loop on them every run.
     """
-    ids = [q[0] for q in queue]
-    texts = [q[1] for q in queue]
-    vectors = get_embeddings_batch(config, texts)
     if vectors and len(vectors) == len(ids):
         failed = []
         for chunk_id, vec in zip(ids, vectors):
@@ -893,11 +1079,11 @@ def cmd_search(args, config):
     if args.semantic:
         results = search_semantic(config, conn, query, args.limit)
     elif args.both:
-        fts_results = search_fts(conn, query, args.limit)
+        fts_results = search_fts(conn, query, args.limit, args.strict)
         sem_results = search_semantic(config, conn, query, args.limit)
         results = merge_results(fts_results, sem_results, args.limit)
     else:
-        results = search_fts(conn, query, args.limit)
+        results = search_fts(conn, query, args.limit, args.strict)
 
     # Apply directory filter if specified
     if args.dir:
@@ -912,42 +1098,47 @@ def cmd_search(args, config):
     conn.close()
 
 
-def search_fts(conn, query, limit=10):
-    """Full-text search using FTS5 BM25."""
-    fts_query = query.replace('"', '""')
+def _fts_terms(query):
+    """Palabras de la consulta, cada una entre comillas para FTS5."""
+    return ['"' + t.replace('"', '""') + '"' for t in re.findall(r"\w+", query)]
 
+
+def _fts_rows(conn, match, limit):
     try:
-        rows = conn.execute(
-            """
+        return conn.execute(
+            f"""
             SELECT c.file_path, c.heading, snippet(chunks_fts, 0, '>>>', '<<<', '...', 40) as snip,
-                   bm25(chunks_fts) as score
+                   bm25(chunks_fts, {BM25_WEIGHTS[0]}, {BM25_WEIGHTS[1]}) as score
             FROM chunks_fts
             JOIN chunks c ON c.id = chunks_fts.rowid
             WHERE chunks_fts MATCH ?
-            ORDER BY bm25(chunks_fts)
+            ORDER BY score
             LIMIT ?
             """,
-            (fts_query, limit),
+            (match, limit),
         ).fetchall()
     except sqlite3.OperationalError:
-        try:
-            rows = conn.execute(
-                """
-                SELECT c.file_path, c.heading, snippet(chunks_fts, 0, '>>>', '<<<', '...', 40) as snip,
-                       bm25(chunks_fts) as score
-                FROM chunks_fts
-                JOIN chunks c ON c.id = chunks_fts.rowid
-                WHERE chunks_fts MATCH ?
-                ORDER BY bm25(chunks_fts)
-                LIMIT ?
-                """,
-                (f'"{fts_query}"', limit),
-            ).fetchall()
-        except sqlite3.OperationalError:
-            return []
+        return None
+
+
+def search_fts(conn, query, limit=10, strict=False):
+    """Full-text search using FTS5 BM25.
+
+    FTS5 exige todas las palabras. Si eso no da nada y no es `strict`, se
+    repite con OR: con consultas largas basta con que falte una palabra
+    para perder el documento, y BM25 ya pone primero los que tienen mas.
+    """
+    terms = _fts_terms(query)
+    # La consulta tal cual admite sintaxis FTS5 (frases, prefijo*). Si no es
+    # sintaxis valida, se busca palabra a palabra.
+    rows = _fts_rows(conn, query, limit)
+    if rows is None and terms:
+        rows = _fts_rows(conn, " ".join(terms), limit)
+    if not rows and not strict and len(terms) > 1:
+        rows = _fts_rows(conn, " OR ".join(terms), limit)
 
     results = []
-    for path, heading, snippet_text, score in rows:
+    for path, heading, snippet_text, score in rows or []:
         clean_snippet = snippet_text.replace(">>>", "").replace("<<<", "")
         results.append(
             {
@@ -973,28 +1164,23 @@ def search_semantic(config, conn, query, limit=10):
 
     query_vec = vectors[0]
 
-    rows = conn.execute(
-        """
-        SELECT e.chunk_id, e.vector, c.file_path, c.heading, c.content
-        FROM embeddings e
-        JOIN chunks c ON c.id = e.chunk_id
-        """
-    ).fetchall()
-
-    if not rows:
+    if not conn.execute("SELECT 1 FROM embeddings LIMIT 1").fetchone():
         print("No embeddings in index. Re-run: ownsearch index", file=sys.stderr)
         return []
 
-    scored = []
-    for chunk_id, vec_blob, path, heading, content in rows:
-        vec = unpack_vector(vec_blob)
-        sim = cosine_sim(query_vec, vec)
-        scored.append((sim, path, heading, content))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
+    if np is not None:
+        top = top_chunks_numpy(config.db_path, conn, query_vec, limit)
+    else:
+        top = top_chunks_python(conn, query_vec, limit)
 
     results = []
-    for sim, path, heading, content in scored[:limit]:
+    for sim, chunk_id in top:
+        row = conn.execute(
+            "SELECT file_path, heading, content FROM chunks WHERE id = ?", (chunk_id,)
+        ).fetchone()
+        if not row:
+            continue
+        path, heading, content = row
         snippet = content[:200].replace("\n", " ")
         results.append(
             {
@@ -1132,12 +1318,22 @@ def main():
     # index
     idx = sub.add_parser("index", help="Index all configured directories")
     idx.add_argument("--full", action="store_true", help="Force full re-index")
+    idx.add_argument(
+        "--workers",
+        type=int,
+        help=f"Parallel embedding requests (default: embed_workers, {DEFAULT_EMBED_WORKERS})",
+    )
 
     # search
     srch = sub.add_parser("search", help="Search the index")
     srch.add_argument("query", nargs="+", help="Search query")
     srch.add_argument("--semantic", action="store_true", help="Use semantic search")
     srch.add_argument("--both", action="store_true", help="Combined FTS + semantic")
+    srch.add_argument(
+        "--strict",
+        action="store_true",
+        help="Full-text: require every word (no OR fallback)",
+    )
     srch.add_argument("--json", action="store_true", help="Output as JSON")
     srch.add_argument("--limit", type=int, default=10, help="Max results (default: 10)")
     srch.add_argument("--dir", help="Filter results to a specific directory")
