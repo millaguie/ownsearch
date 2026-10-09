@@ -15,6 +15,12 @@ from unittest import mock
 import ownsearch
 
 HAS_NUMPY = ownsearch._numpy() is not None
+try:
+    import PIL  # noqa: F401
+
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 
 
 def fake_vec(text, dim=8):
@@ -273,13 +279,20 @@ class TestImages(Base):
         self.index_with_ocr(fail)
         self.assertEqual(self.indexed(), [])
 
+    @unittest.skipIf(not HAS_PIL, "Pillow not installed")
     def test_corrupt_image_is_not_retried(self):
+        # Pillow avisa con UnidentifiedImageError, que es un OSError.
         self.image("doc.png")
-
-        def fail(path, config):
-            raise ValueError("cannot identify image")
-
-        self.index_with_ocr(fail)
+        self.config.data.update(
+            ocr_engine="vlm", ocr_base_url="http://gw/v1", ocr_model="m"
+        )
+        with (
+            mock.patch.object(ownsearch.Config, "images_enabled", return_value=True),
+            mock.patch("urllib.request.urlopen") as urlopen,
+            mock.patch("sys.stderr"),
+        ):
+            self.index(embed=False)
+        urlopen.assert_not_called()
         self.assertEqual(self.indexed(), ["doc.png"])
 
     def test_without_pillow_only_small_web_images_are_sent(self):
@@ -344,6 +357,22 @@ class TestImages(Base):
                 mock.patch.object(ownsearch, "_image_data_url", return_value="data:x"),
                 mock.patch("urllib.request.urlopen", side_effect=err),
                 self.assertRaises(expected),
+            ):
+                ownsearch.ocr_image(self.docs / "doc.png", self.config)
+
+    def test_vlm_bad_response_is_retried(self):
+        self.config.data.update(
+            ocr_engine="vlm", ocr_base_url="http://gw/v1", ocr_model="m"
+        )
+        self.config._ocr_api_key = ""
+        self.image("doc.png")
+        for body in (b"<html>oops</html>", b'{"error": "x"}', b'{"choices": []}'):
+            resp = mock.MagicMock()
+            resp.__enter__.return_value.read.return_value = body
+            with (
+                mock.patch.object(ownsearch, "_image_data_url", return_value="data:x"),
+                mock.patch("urllib.request.urlopen", return_value=resp),
+                self.assertRaises(ownsearch.OcrUnavailable),
             ):
                 ownsearch.ocr_image(self.docs / "doc.png", self.config)
 
@@ -653,6 +682,31 @@ class TestSemantic(Base):
                     self.config, self.conn(), "q", limit=5, dir_prefix=prefix
                 )
             self.assertEqual([Path(r["path"]).name for r in res], ["x.md"])
+
+    def test_unembeddable_query_is_asked_once(self):
+        calls = []
+
+        def request(config, data, retries=5):
+            calls.append(1)
+            return ownsearch.PERMANENT_FAIL
+
+        with (
+            mock.patch.object(ownsearch, "_embed_request", side_effect=request),
+            mock.patch("sys.stderr"),
+        ):
+            self.assertEqual(
+                ownsearch.search_semantic(self.config, self.conn(), "q"), []
+            )
+        self.assertEqual(len(calls), 1)
+
+    def test_status_json_with_empty_db_file(self):
+        Path(self.config.data["db_path"] + ".empty").write_bytes(b"")
+        self.config.data["db_path"] += ".empty"
+        with (
+            mock.patch.object(ownsearch, "ollama_available", return_value=False),
+        ):
+            data = ownsearch.status_data(self.config)
+        self.assertEqual(data["chunks"], 0)
 
     def test_unembeddable_query_is_empty_not_down(self):
         with (

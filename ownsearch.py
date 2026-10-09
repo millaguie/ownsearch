@@ -48,6 +48,7 @@ DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_EMBED_MODEL = "bge-m3"
 EMBED_DIM = 1024
 MAX_CHUNK_CHARS = 4000
+MAX_OVERLAP = MAX_CHUNK_CHARS // 2
 # bge-m3 admite 8192 tokens. En texto latino 8000 caracteres caben y el
 # fragmento entero (titulo incluido) llega al modelo; en escrituras densas
 # (chino, japones...) el servidor puede recortar el final.
@@ -260,7 +261,7 @@ class Config:
     @property
     def chunk_overlap(self):
         try:
-            return max(0, int(self.data.get("chunk_overlap", 0)))
+            return min(MAX_OVERLAP, max(0, int(self.data.get("chunk_overlap", 0))))
         except (TypeError, ValueError):
             return 0
 
@@ -407,9 +408,9 @@ def get_embeddings_batch(config, texts, retries=5):
         and len(embeddings) == len(texts)
     ):
         return embeddings
-    if embeddings is not PERMANENT_FAIL and len(texts) == 1:
+    if len(texts) == 1:
         # Con un solo texto, probarlo "uno a uno" repetiria la misma peticion.
-        return [None]
+        return [PERMANENT_FAIL if embeddings is PERMANENT_FAIL else None]
 
     # Batch failed — fall back to one-by-one. A single poisoned text (NaN) makes
     # ollama 500 the whole batch, so isolating per-text salvages the rest.
@@ -932,9 +933,8 @@ def _ocr_local(path):
     np_ = _numpy()
     if np_ is None:
         raise OcrUnavailable("local OCR needs numpy")
+    rgb = np_.asarray(_open_rgb(path, Image, ImageOps))
     layout, text_model = get_runtime()
-    with Image.open(path) as im:
-        rgb = np_.asarray(ImageOps.exif_transpose(im).convert("RGB"))
     blocks, _ = _analyze_page(rgb, layout.predict(rgb), text_model, 0)
     parts = []
     for block in blocks:
@@ -955,6 +955,23 @@ VLM_RAW_MAX_BYTES = 5 * 1024 * 1024
 VLM_IMAGE_ERRORS = {400, 413, 415, 422}
 
 
+def _open_rgb(path, Image, ImageOps):
+    """Abre la imagen como RGB.
+
+    Pillow avisa de una imagen corrupta con OSError (UnidentifiedImageError,
+    "image file is truncated"), que index tomaria por un fallo transitorio y
+    reintentaria siempre. Se lee el fichero aparte (un fallo de disco sigue
+    siendo OSError) y los fallos al decodificar pasan a ValueError: la
+    imagen se registra sin chunks hasta que cambie.
+    """
+    data = path.read_bytes()
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            return ImageOps.exif_transpose(im).convert("RGB")
+    except (OSError, SyntaxError) as e:
+        raise ValueError(f"cannot decode image: {e}") from e
+
+
 def _image_data_url(path):
     """Imagen como data URL. Con Pillow se reduce a 1600 px: una foto de
     movil ocupa varios MB y el modelo no necesita tanto. Sin Pillow solo se
@@ -969,11 +986,10 @@ def _image_data_url(path):
             ) from None
         data, mime = path.read_bytes(), IMAGE_MIME[suffix]
     else:
-        with Image.open(path) as im:
-            im = ImageOps.exif_transpose(im).convert("RGB")
-            im.thumbnail((1600, 1600))
-            buf = io.BytesIO()
-            im.save(buf, "JPEG", quality=85)
+        im = _open_rgb(path, Image, ImageOps)
+        im.thumbnail((1600, 1600))
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=85)
         data, mime = buf.getvalue(), "image/jpeg"
     return f"data:{mime};base64," + base64.b64encode(data).decode()
 
@@ -1004,7 +1020,7 @@ def _ocr_vlm(path, config):
     )
     try:
         with urllib.request.urlopen(req, timeout=300) as resp:
-            result = json.loads(resp.read())
+            body = resp.read()
     except urllib.error.HTTPError as e:
         if e.code in VLM_IMAGE_ERRORS:
             # El endpoint rechaza esta imagen en concreto (no la puede leer,
@@ -1012,7 +1028,13 @@ def _ocr_vlm(path, config):
             # arregla: ValueError la registra sin chunks hasta que cambie.
             raise ValueError(f"OCR endpoint rejected the image: HTTP {e.code}") from e
         raise
-    return result["choices"][0]["message"].get("content") or ""
+    try:
+        return json.loads(body)["choices"][0]["message"].get("content") or ""
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError) as e:
+        # Un 200 sin la forma esperada (pagina de error de un proxy, JSON
+        # cortado, {"error": ...}) es un problema del servicio, no de la
+        # imagen: se reintenta.
+        raise OcrUnavailable(f"unexpected OCR response: {e}") from e
 
 
 def _docvortex_markdown(path, **options):
@@ -1184,13 +1206,16 @@ def cmd_config_set(args, config):
         print("ocr_engine must be 'local' or 'vlm'", file=sys.stderr)
         sys.exit(1)
     if key in ("embed_workers", "chunk_overlap"):
-        minimum = 1 if key == "embed_workers" else 0
+        # Un solape mayor que medio chunk dejaria el chunk fuera de su vector.
+        minimum, maximum = (1, 1000) if key == "embed_workers" else (0, MAX_OVERLAP)
         try:
             value = int(value)
-            if value < minimum:
+            if not minimum <= value <= maximum:
                 raise ValueError
         except ValueError:
-            print(f"{key} must be an integer >= {minimum}", file=sys.stderr)
+            print(
+                f"{key} must be an integer from {minimum} to {maximum}", file=sys.stderr
+            )
             sys.exit(1)
 
     old_value = config.data.get(key)
@@ -1566,7 +1591,7 @@ def cmd_search(args, config):
     dir_prefix = None
     if args.dir:
         # Con separador final: --dir ~/notes no debe incluir ~/notes-viejas.
-        dir_prefix = str(Path(args.dir).resolve()).rstrip(os.sep) + os.sep
+        dir_prefix = str(Path(args.dir).expanduser().resolve()).rstrip(os.sep) + os.sep
 
     degraded = False
     if args.semantic or args.both:
@@ -1880,6 +1905,14 @@ def status_data(config):
     if config.db_path.exists():
         data["db_bytes"] = config.db_path.stat().st_size
         conn = sqlite3.connect(str(config.db_path))
+        # Un fichero sin tablas (index cortado antes de crearlas) cuenta como
+        # indice vacio, no como error.
+        has_tables = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='files'"
+        ).fetchone()
+        if not has_tables:
+            conn.close()
+            conn = None
     try:
         for d in config.data.get("directories", []):
             files = None
