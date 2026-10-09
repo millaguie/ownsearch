@@ -32,8 +32,9 @@ DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_EMBED_MODEL = "bge-m3"
 EMBED_DIM = 1024
 MAX_CHUNK_CHARS = 4000
-# bge-m3 admite 8192 tokens, asi que 8000 caracteres caben de sobra y el
-# fragmento entero (titulo incluido) llega al modelo.
+# bge-m3 admite 8192 tokens. En texto latino 8000 caracteres caben y el
+# fragmento entero (titulo incluido) llega al modelo; en escrituras densas
+# (chino, japones...) el servidor puede recortar el final.
 EMBED_MAX_CHARS = 8000
 BATCH_SIZE = 5
 DEFAULT_EMBED_WORKERS = 4
@@ -602,6 +603,31 @@ def _vectors_rev(conn):
     return f"{rev}:{count}:{max_id}"
 
 
+def _cache_matches_db(conn, mat, ids, samples=8):
+    """Compara unas filas de la cache con la base de datos.
+
+    vectors_rev y la huella COUNT/MAX no ven todo: una version anterior que
+    reindexa entero reutiliza los mismos chunk_id, y dos procesos que
+    reconstruyen a la vez pueden mezclar ficheros. Unas pocas lecturas por
+    chunk_id lo detectan sin leer toda la tabla.
+    """
+    n = ids.shape[0]
+    if n == 0:
+        return True
+    picks = {0, n - 1} | {(n * k) // samples for k in range(1, samples)}
+    for i in picks:
+        row = conn.execute(
+            "SELECT vector FROM embeddings WHERE chunk_id = ?", (int(ids[i]),)
+        ).fetchone()
+        if row is None or len(row[0]) != mat.shape[1] * 4:
+            return False
+        vec = np.frombuffer(row[0], dtype=np.float32)
+        norm = np.linalg.norm(vec)
+        if norm and not np.allclose(vec / norm, mat[i], atol=1e-5):
+            return False
+    return True
+
+
 def _load_cached_matrix(mat_path, ids_path):
     """Lee la cache; None si falta, esta corrupta o no cuadra."""
     try:
@@ -636,7 +662,7 @@ def load_vector_matrix(db_path, conn):
         cached_rev = None
     if rev is not None and cached_rev == rev:
         cached = _load_cached_matrix(mat_path, ids_path)
-        if cached is not None:
+        if cached is not None and _cache_matches_db(conn, *cached):
             return cached
 
     rows = conn.execute("SELECT chunk_id, vector FROM embeddings").fetchall()
@@ -692,6 +718,8 @@ def top_chunks_numpy(db_path, conn, query_vec, limit):
         return []
     sims = mat @ (q / norm)
     k = min(limit, len(sims))
+    if k < 1:
+        return []
     top = np.argpartition(-sims, k - 1)[:k]
     top = top[np.argsort(-sims[top])]
     return [(float(sims[i]), int(ids[i])) for i in top]
@@ -700,8 +728,11 @@ def top_chunks_numpy(db_path, conn, query_vec, limit):
 def top_chunks_python(conn, query_vec, limit):
     """Lo mismo que top_chunks_numpy, sin dependencias. Lento con mucho indice."""
     scored = []
+    size = len(query_vec) * 4
     for chunk_id, vec_blob in conn.execute("SELECT chunk_id, vector FROM embeddings"):
-        scored.append((cosine_sim(query_vec, unpack_vector(vec_blob)), chunk_id))
+        # Igual que la ruta numpy: los restos de otro modelo no se comparan.
+        if len(vec_blob) == size:
+            scored.append((cosine_sim(query_vec, unpack_vector(vec_blob)), chunk_id))
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[:limit]
 
@@ -918,9 +949,6 @@ def cmd_index(args, config):
 
     # Check embeddings availability (auto-pull if needed)
     has_embeddings = ensure_embeddings_ready(config)
-    # Sin embeddings previos (indice nuevo o modelo cambiado), todos los que
-    # se hagan ahora usan el recorte actual.
-    fresh_embeds = not conn.execute("SELECT 1 FROM embeddings LIMIT 1").fetchone()
 
     # Gather all current files across all directories
     current_files = {}  # absolute_path -> (dir_str, mtime_ns, size)
@@ -970,6 +998,10 @@ def cmd_index(args, config):
         conn.execute("DELETE FROM chunks WHERE file_path = ?", (path,))
         conn.execute("DELETE FROM files WHERE path = ?", (path,))
     conn.commit()
+    # Sin embeddings que sobrevivan al borrado (indice nuevo, modelo cambiado
+    # o todos los ficheros cambiados), todos los de este run usan el recorte
+    # actual.
+    fresh_embeds = not conn.execute("SELECT 1 FROM embeddings LIMIT 1").fetchone()
 
     # Index new/changed files
     total_chunks = 0
@@ -978,77 +1010,77 @@ def cmd_index(args, config):
     workers = args.workers or config.embed_workers
     embedder = _Embedder(config, conn, workers) if has_embeddings else None
 
-    for i, path in enumerate(to_index, 1):
-        full_path = Path(path)
-        dir_str, mtime_ns, size = current_files[path]
-        try:
-            text, is_markdown = extract_text(full_path)
-        except (OSError, PermissionError) as e:
-            print(f"  Skip {path}: {e}", file=sys.stderr)
-            continue
-        except Exception as e:  # noqa: BLE001
-            # Documento corrupto o no soportado. Se registra sin chunks para
-            # no reintentar la conversion hasta que cambie el fichero.
-            print(f"  Skip {path}: conversion failed: {e}", file=sys.stderr)
+    path = None
+    try:
+        for i, path in enumerate(to_index, 1):
+            full_path = Path(path)
+            dir_str, mtime_ns, size = current_files[path]
+            try:
+                text, is_markdown = extract_text(full_path)
+            except (OSError, PermissionError) as e:
+                print(f"  Skip {path}: {e}", file=sys.stderr)
+                continue
+            except Exception as e:  # noqa: BLE001
+                # Documento corrupto o no soportado. Se registra sin chunks para
+                # no reintentar la conversion hasta que cambie el fichero.
+                print(f"  Skip {path}: conversion failed: {e}", file=sys.stderr)
+                conn.execute(
+                    "INSERT INTO files (path, directory, mtime_ns, size) VALUES (?, ?, ?, ?)",
+                    (path, dir_str, mtime_ns, size),
+                )
+                continue
+
             conn.execute(
                 "INSERT INTO files (path, directory, mtime_ns, size) VALUES (?, ?, ?, ?)",
                 (path, dir_str, mtime_ns, size),
             )
-            continue
 
-        conn.execute(
-            "INSERT INTO files (path, directory, mtime_ns, size) VALUES (?, ?, ?, ?)",
-            (path, dir_str, mtime_ns, size),
-        )
+            if is_markdown:
+                chunks = chunk_markdown(text)
+            else:
+                chunks = chunk_plaintext(text)
 
-        if is_markdown:
-            chunks = chunk_markdown(text)
-        else:
-            chunks = chunk_plaintext(text)
+            for idx, (heading, content) in enumerate(chunks):
+                cur = conn.execute(
+                    "INSERT INTO chunks (file_path, chunk_index, heading, content) VALUES (?, ?, ?, ?)",
+                    (path, idx, heading, content),
+                )
+                total_chunks += 1
+                if has_embeddings and len(content.strip()) >= 50:
+                    # Prefix heading for better embedding context
+                    embed_text = f"{heading}: {content}" if heading else content
+                    embed_queue.append((cur.lastrowid, embed_text[:EMBED_MAX_CHARS]))
 
-        for idx, (heading, content) in enumerate(chunks):
-            cur = conn.execute(
-                "INSERT INTO chunks (file_path, chunk_index, heading, content) VALUES (?, ?, ?, ?)",
-                (path, idx, heading, content),
-            )
-            total_chunks += 1
-            if has_embeddings and len(content.strip()) >= 50:
-                # Prefix heading for better embedding context
-                embed_text = f"{heading}: {content}" if heading else content
-                embed_queue.append((cur.lastrowid, embed_text[:EMBED_MAX_CHARS]))
+                if has_embeddings and len(embed_queue) >= BATCH_SIZE:
+                    failed_ids += embedder.submit(embed_queue)
+                    embed_queue = []
 
-            if has_embeddings and len(embed_queue) >= BATCH_SIZE:
+            if i % 20 == 0:
+                print(f"  {i}/{len(to_index)} files...")
+                conn.commit()
+
+        if has_embeddings:
+            if embed_queue:
                 failed_ids += embedder.submit(embed_queue)
-                embed_queue = []
-
-        if i % 20 == 0:
-            print(f"  {i}/{len(to_index)} files...")
-            conn.commit()
-
-    if has_embeddings:
-        if embed_queue:
-            failed_ids += embedder.submit(embed_queue)
-        failed_ids += embedder.finish()
+            failed_ids += embedder.finish()
+    except BaseException:
+        # Ctrl-C o fallo a mitad: los ficheros ya guardados con lotes aun en
+        # vuelo quedan marcados para reintentar, o el incremental siguiente
+        # los daria por completos sin embeddings.
+        if embedder is not None:
+            pending = [cid for cid, _ in embed_queue] + embedder.abort()
+            _mark_for_retry(conn, failed_ids + pending)
+        if path is not None:
+            # El fichero en curso puede tener solo parte de sus chunks.
+            conn.execute("UPDATE files SET mtime_ns = -1 WHERE path = ?", (path,))
+        bump_vectors_rev(conn)
+        conn.commit()
+        raise
 
     # Any file with a failed embedding is unmarked (mtime_ns = -1) so the next
     # incremental run re-indexes it. We keep its chunks for now, so the file
     # stays searchable (FTS + whatever embeddings did succeed) in the meantime.
-    if failed_ids:
-        placeholders = ",".join("?" * len(failed_ids))
-        failed_files = {
-            row[0]
-            for row in conn.execute(
-                f"SELECT DISTINCT file_path FROM chunks WHERE id IN ({placeholders})",
-                failed_ids,
-            )
-        }
-        for fp in failed_files:
-            conn.execute("UPDATE files SET mtime_ns = -1 WHERE path = ?", (fp,))
-        print(
-            f"  Warning: {len(failed_ids)} chunk(s) across {len(failed_files)} file(s) "
-            f"failed to embed; those files will be re-indexed on the next run.",
-            file=sys.stderr,
-        )
+    _mark_for_retry(conn, failed_ids)
 
     bump_vectors_rev(conn)
 
@@ -1070,6 +1102,30 @@ def cmd_index(args, config):
         embed_count = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
         print(f"  Embeddings: {embed_count}")
     conn.close()
+
+
+def _mark_for_retry(conn, chunk_ids):
+    """Pone mtime_ns = -1 a los ficheros de esos chunks para reindexarlos."""
+    if not chunk_ids:
+        return
+    failed_files = set()
+    for i in range(0, len(chunk_ids), 500):
+        part = chunk_ids[i : i + 500]
+        placeholders = ",".join("?" * len(part))
+        failed_files |= {
+            row[0]
+            for row in conn.execute(
+                f"SELECT DISTINCT file_path FROM chunks WHERE id IN ({placeholders})",
+                part,
+            )
+        }
+    for fp in failed_files:
+        conn.execute("UPDATE files SET mtime_ns = -1 WHERE path = ?", (fp,))
+    print(
+        f"  Warning: {len(chunk_ids)} chunk(s) across {len(failed_files)} file(s) "
+        f"failed to embed; those files will be re-indexed on the next run.",
+        file=sys.stderr,
+    )
 
 
 class _Embedder:
@@ -1104,6 +1160,13 @@ class _Embedder:
             failed += self._drain_one()
         self.pool.shutdown()
         return failed
+
+    def abort(self):
+        """Cancela lo pendiente sin esperar. Devuelve los chunk_ids sin guardar."""
+        ids = [cid for batch, _ in self.pending for cid in batch]
+        self.pending.clear()
+        self.pool.shutdown(wait=False, cancel_futures=True)
+        return ids
 
     def _drain_one(self):
         ids, future = self.pending.popleft()
@@ -1179,9 +1242,25 @@ def cmd_search(args, config):
     conn.close()
 
 
+FTS_OPERATORS = {"AND", "OR", "NOT", "NEAR"}
+
+
 def _fts_terms(query):
-    """Palabras de la consulta, cada una entre comillas para FTS5."""
-    return ['"' + t.replace('"', '""') + '"' for t in re.findall(r"\w+", query)]
+    """Palabras de la consulta, cada una entre comillas para FTS5.
+
+    Quita los operadores de FTS5 y las palabras con `-` delante: quien
+    escribe `-cilium` quiere excluir cilium, no buscarlo en el plan B.
+    """
+    terms = []
+    for token in query.split():
+        if token in FTS_OPERATORS or token.startswith("-"):
+            continue
+        terms += re.findall(r"\w+", token)
+    return ['"' + t.replace('"', '""') + '"' for t in terms]
+
+
+def _has_fts_operators(query):
+    return any(token in FTS_OPERATORS for token in query.split())
 
 
 def _fts_rows(conn, match, limit):
@@ -1210,11 +1289,14 @@ def search_fts(conn, query, limit=10, strict=False):
     para perder el documento, y BM25 ya pone primero los que tienen mas.
     """
     terms = _fts_terms(query)
+    # Con operadores explicitos (AND, OR, NOT, NEAR) quien busca ya decide
+    # la logica: no se cambia por un OR.
+    strict = strict or _has_fts_operators(query)
     # La consulta tal cual admite sintaxis FTS5 (frases, prefijo*). Si no es
     # sintaxis valida o no da nada, se buscan las palabras sueltas con AND.
     rows = _fts_rows(conn, query, limit)
     and_query = " ".join(terms)
-    if not rows and terms and and_query != query:
+    if rows is None or (not rows and not strict and and_query != query):
         rows = _fts_rows(conn, and_query, limit)
     if not rows and not strict and len(terms) > 1:
         rows = _fts_rows(conn, " OR ".join(terms), limit)
@@ -1428,7 +1510,9 @@ def main():
         help="Full-text: require every word (no OR fallback)",
     )
     srch.add_argument("--json", action="store_true", help="Output as JSON")
-    srch.add_argument("--limit", type=int, default=10, help="Max results (default: 10)")
+    srch.add_argument(
+        "--limit", type=_positive_int, default=10, help="Max results (default: 10)"
+    )
     srch.add_argument("--dir", help="Filter results to a specific directory")
 
     # config

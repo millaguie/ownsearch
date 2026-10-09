@@ -91,6 +91,14 @@ class TestFts(Base):
         self.assertEqual(self.paths(res)[:2], ["b.md", "a.md"])
         self.assertGreater(res[0]["score"], res[1]["score"])
 
+    def test_excluded_word_is_not_searched_in_fallback(self):
+        res = ownsearch.search_fts(self.conn(), "radio -cilium")
+        self.assertNotIn("k8s.md", self.paths(res))
+
+    def test_explicit_operators_disable_fallback(self):
+        res = ownsearch.search_fts(self.conn(), "kubernetes AND jamming")
+        self.assertEqual(res, [])
+
 
 class TestIndex(Base):
     def test_long_chunk_is_embedded_whole(self):
@@ -139,6 +147,34 @@ class TestIndex(Base):
         mtime = self.conn().execute("SELECT mtime_ns FROM files").fetchone()[0]
         self.assertEqual(mtime, -1)
 
+    def test_interrupt_marks_unfinished_files_for_retry(self):
+        for i in range(12):
+            self.write(f"n{i}.md", f"# Note {i}\n\n" + f"word{i} " * 20)
+        real_submit = ownsearch._Embedder.submit
+        calls = []
+
+        def submit(embedder, queue):
+            calls.append(1)
+            if len(calls) == 2:
+                raise KeyboardInterrupt
+            return real_submit(embedder, queue)
+
+        with (
+            mock.patch.object(ownsearch._Embedder, "submit", submit),
+            mock.patch("sys.stderr"),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            self.index()
+        conn = self.conn()
+        rows = conn.execute(
+            "SELECT f.path, f.mtime_ns, COUNT(e.chunk_id) FROM files f "
+            "LEFT JOIN chunks c ON c.file_path = f.path "
+            "LEFT JOIN embeddings e ON e.chunk_id = c.id GROUP BY f.path"
+        ).fetchall()
+        self.assertTrue(rows)
+        for path, mtime, embeds in rows:
+            self.assertTrue(mtime == -1 or embeds > 0, path)
+
     def test_workers_must_be_positive(self):
         with self.assertRaises(Exception):
             ownsearch._positive_int("0")
@@ -155,6 +191,15 @@ class TestTruncationWarning(Base):
     def setUp(self):
         super().setUp()
         self.write("a.md", "# A\n\n" + "alpha " * 20)
+
+    def test_warning_clears_when_every_file_changes(self):
+        self.index()
+        conn = self.conn()
+        conn.execute("DELETE FROM meta WHERE key = 'embed_max_chars'")
+        conn.commit()
+        self.write("a.md", "# A\n\n" + "changed " * 20)
+        self.index()
+        self.assertIsNone(ownsearch.embeds_truncated_at(conn))
 
     def test_new_index_has_no_warning(self):
         self.index()
@@ -214,6 +259,33 @@ class TestSemantic(Base):
         self.assertEqual([r["path"] for r in fast], [r["path"] for r in pure])
         for a, b in zip(fast, pure):
             self.assertAlmostEqual(a["score"], b["score"], places=3)
+
+    def test_negative_limit_returns_nothing(self):
+        if ownsearch.np is not None:
+            self.assertEqual(
+                ownsearch.top_chunks_numpy(
+                    self.config.db_path, self.conn(), fake_vec("q"), -30
+                ),
+                [],
+            )
+        with self.assertRaises(Exception):
+            ownsearch._positive_int("-30")
+
+    @unittest.skipIf(ownsearch.np is None, "numpy not installed")
+    def test_cache_detects_rewritten_vectors_with_same_ids(self):
+        # Una version anterior que reindexa entero deja los mismos chunk_id.
+        self.search()
+        conn = self.conn()
+        for (cid,) in conn.execute("SELECT chunk_id FROM embeddings").fetchall():
+            vec = fake_vec(f"other {cid}")
+            conn.execute(
+                "UPDATE embeddings SET vector = ? WHERE chunk_id = ?",
+                (ownsearch.pack_vector(vec), cid),
+            )
+        conn.commit()
+        with mock.patch.object(ownsearch, "np", None):
+            pure = self.search()
+        self.assertEqual([r["path"] for r in self.search()], [r["path"] for r in pure])
 
     @unittest.skipIf(ownsearch.np is None, "numpy not installed")
     def test_corrupt_cache_is_rebuilt(self):
