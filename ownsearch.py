@@ -951,6 +951,8 @@ def _ocr_local(path):
 # Formatos que un modelo con vision acepta tal cual, sin Pillow.
 VLM_RAW_MIME = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 VLM_RAW_MAX_BYTES = 5 * 1024 * 1024
+# Respuestas del endpoint de OCR que dependen de la imagen, no del servicio.
+VLM_IMAGE_ERRORS = {400, 413, 415, 422}
 
 
 def _image_data_url(path):
@@ -1000,8 +1002,16 @@ def _ocr_vlm(path, config):
     req = urllib.request.Request(
         f"{base}/chat/completions", data=json.dumps(body).encode(), headers=headers
     )
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        result = json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        if e.code in VLM_IMAGE_ERRORS:
+            # El endpoint rechaza esta imagen en concreto (no la puede leer,
+            # es demasiado grande...). Reintentarla en cada index no la
+            # arregla: ValueError la registra sin chunks hasta que cambie.
+            raise ValueError(f"OCR endpoint rejected the image: HTTP {e.code}") from e
+        raise
     return result["choices"][0]["message"].get("content") or ""
 
 

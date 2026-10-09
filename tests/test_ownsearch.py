@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -330,6 +331,21 @@ class TestImages(Base):
         self.assertEqual(sent["body"]["model"], "qwen-vl")
         content = sent["body"]["messages"][0]["content"]
         self.assertEqual(content[1]["image_url"]["url"], "data:x")
+
+    def test_vlm_rejected_image_is_not_retried(self):
+        self.config.data.update(
+            ocr_engine="vlm", ocr_base_url="http://gw/v1", ocr_model="m"
+        )
+        self.config._ocr_api_key = ""
+        self.image("doc.png")
+        for code, expected in ((400, ValueError), (503, OSError)):
+            err = urllib.error.HTTPError("http://gw", code, "x", {}, None)
+            with (
+                mock.patch.object(ownsearch, "_image_data_url", return_value="data:x"),
+                mock.patch("urllib.request.urlopen", side_effect=err),
+                self.assertRaises(expected),
+            ):
+                ownsearch.ocr_image(self.docs / "doc.png", self.config)
 
     def test_add_and_remove_image_dir(self):
         other = self.root / "pics"
